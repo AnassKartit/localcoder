@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "localcoder"
+version = "0.1.0"
+description = "Local AI coding agent — auto-installs, auto-serves, zero config. Works with Gemma 4, Qwen 3.5, and any model via llama.cpp or Ollama."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Anass Kartit" }]
+keywords = ["localcoder", "ai", "coding", "agent", "llama.cpp", "ollama", "gemma4", "qwen", "local"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Code Generators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "rich>=13.0",
+    "prompt_toolkit>=3.0",
+    "huggingface-hub>=0.20",
+]
+
+[project.scripts]
+localcoder = "localcoder.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/localcoder"]
+
+[project.urls]
+Homepage = "https://github.com/AnassKartit/localcoder"
+Repository = "https://github.com/AnassKartit/localcoder"
