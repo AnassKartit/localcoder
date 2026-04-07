@@ -563,7 +563,7 @@ def _detect_model_info(server_config, model_id=None):
 
         # Detect model name from path
         name_patterns = [
-            (r'gemma[-_]?4[-_]?(\d+[bB])', 'Gemma 4'),
+            (r'gemma[-_]?4[-_]?(E?\d+[bB])', 'Gemma 4'),
             (r'qwen[-_]?3\.?5[-_]?(\d+[bB])', 'Qwen 3.5'),
             (r'llama[-_]?3[-_.]?(\d+[bB])', 'Llama 3'),
             (r'mistral[-_]?(\d+[bB])', 'Mistral'),

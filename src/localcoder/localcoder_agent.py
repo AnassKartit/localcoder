@@ -30,6 +30,7 @@ console = Console()
 API_BASE = os.environ.get("GEMMA_API_BASE", "http://127.0.0.1:8089/v1")
 MODEL = os.environ.get("GEMMA_MODEL", "gemma4-26b")
 CWD = os.getcwd()
+REASONING_EFFORT = "medium"  # none, low, medium, high — toggle with /think
 
 # ── Backend detection ──
 def detect_backend():
@@ -1335,7 +1336,12 @@ def compress_messages(messages, max_tokens=12000):
     # Pass 3: Emergency — keep only system + last 3
     return [system] + rest[-3:]
 
-def chat_api(messages):
+def chat_api(messages, spinner=None):
+    """Call the LLM API with streaming.
+
+    Streams text content live to console, accumulates tool calls.
+    Returns a compatible response dict for agent_loop.
+    """
     before = len(messages)
     messages = compress_messages(messages)
     tokens_est = estimate_tokens(json.dumps(messages))
@@ -1343,14 +1349,141 @@ def chat_api(messages):
         logging.getLogger("localcoder").info(f"Compressed {before} → {len(messages)} msgs (~{tokens_est} tokens)")
     else:
         logging.getLogger("localcoder").debug(f"API call: {len(messages)} msgs, ~{tokens_est} tokens")
-    payload = json.dumps({"model": MODEL, "messages": messages, "tools": TOOLS, "temperature": 1.0, "top_p": 0.95}).encode()
-    req = urllib.request.Request(f"{API_BASE}/chat/completions", data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        data = json.loads(resp.read())
-    usage = data.get("usage", {})
-    tps = data.get("timings", {}).get("predicted_per_second", 0)
-    logging.getLogger("localcoder").info(f"Response: {usage.get('completion_tokens',0)} tokens, {tps:.0f} tok/s, prompt={usage.get('prompt_tokens',0)}")
-    return data
+
+    body = {
+        "model": MODEL, "messages": messages, "tools": TOOLS,
+        "temperature": 1.0, "top_p": 0.95, "stream": True,
+    }
+    if REASONING_EFFORT != "medium":
+        body["reasoning_effort"] = REASONING_EFFORT
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"{API_BASE}/chat/completions", data=payload,
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+
+    content_parts = []
+    reasoning_parts = []
+    tool_calls = {}  # index → {id, function: {name, arguments}}
+    finish_reason = None
+    usage = {}
+    timings = {}
+    model_name = MODEL
+    streaming_started = False
+    reasoning_started = False
+    token_count = 0
+
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":"):
+                continue
+            if line == "data: [DONE]":
+                break
+            if not line.startswith("data: "):
+                continue
+            try:
+                chunk = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            finish_reason = chunk.get("choices", [{}])[0].get("finish_reason") or finish_reason
+            model_name = chunk.get("model", model_name)
+
+            # Usage info (llama.cpp sends it in the last chunk)
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            if chunk.get("timings"):
+                timings = chunk["timings"]
+
+            def _kill_spinner():
+                """Fully stop the spinner and clear its terminal line."""
+                nonlocal spinner
+                if spinner:
+                    try:
+                        if spinner._live is not None:
+                            spinner._live.stop()
+                            spinner._live = None
+                    except Exception:
+                        pass
+                    spinner = None
+                    # Clear the spinner line and move cursor
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+
+            # Stream reasoning content (dimmed, hidden when effort=none)
+            reasoning_chunk = delta.get("reasoning_content", "")
+            if reasoning_chunk:
+                reasoning_parts.append(reasoning_chunk)
+                token_count += 1
+                if REASONING_EFFORT != "none":
+                    if not reasoning_started:
+                        reasoning_started = True
+                        _kill_spinner()
+                        sys.stdout.write("  \033[2;35m┌─ thinking ─────────────────────\033[0m\n  \033[2;35m│ \033[0m\033[2m")
+                        sys.stdout.flush()
+                    sys.stdout.write(f"\033[2m{reasoning_chunk}\033[0m")
+                    sys.stdout.flush()
+
+            # Stream text content live (normal style)
+            text_chunk = delta.get("content", "")
+            if text_chunk:
+                if not streaming_started:
+                    streaming_started = True
+                    if reasoning_started:
+                        # End reasoning block, start content
+                        sys.stdout.write("\033[0m\n  \033[2;35m└────────────────────────────────\033[0m\n\n  ")
+                    else:
+                        _kill_spinner()
+                        sys.stdout.write("  ")
+                    sys.stdout.flush()
+                sys.stdout.write(text_chunk)
+                sys.stdout.flush()
+                content_parts.append(text_chunk)
+                token_count += 1
+
+            # Accumulate tool calls
+            for tc_delta in delta.get("tool_calls", []):
+                idx = tc_delta.get("index", 0)
+                if idx not in tool_calls:
+                    tool_calls[idx] = {
+                        "id": tc_delta.get("id", f"call_{idx}"),
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                if tc_delta.get("function", {}).get("name"):
+                    tool_calls[idx]["function"]["name"] = tc_delta["function"]["name"]
+                if tc_delta.get("function", {}).get("arguments"):
+                    tool_calls[idx]["function"]["arguments"] += tc_delta["function"]["arguments"]
+
+    if streaming_started:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    # Build compatible response dict
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    msg = {"role": "assistant", "content": content}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls.keys())]
+
+    if not usage:
+        usage = {"completion_tokens": token_count, "prompt_tokens": 0, "total_tokens": token_count}
+
+    tps = timings.get("predicted_per_second", 0)
+    logging.getLogger("localcoder").info(
+        f"Response: {usage.get('completion_tokens',0)} tokens, {tps:.0f} tok/s, prompt={usage.get('prompt_tokens',0)}"
+    )
+
+    return {
+        "choices": [{"message": msg, "finish_reason": finish_reason}],
+        "usage": usage,
+        "timings": timings,
+        "model": model_name,
+    }
 
 # ── Rich display ──
 def show_tool_call(fname, args):
@@ -1374,17 +1507,150 @@ def show_image_inline(path):
     subprocess.Popen(["open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     console.print(f"  [dim green]📸 Opened {os.path.basename(path)} in Preview[/]")
 
-def show_result(result):
+def show_result(result, tool_name=None):
     if not result or result == "(no output)":
         return
+
+    # ── Search results: rich formatted cards ──
+    if tool_name == "web_search" and "earch results for" in result:
+        _show_search_results(result)
+        return
+
+    # ── Fetch URL: show status + preview ──
+    if tool_name == "fetch_url" and result.startswith("Status:"):
+        _show_fetch_result(result)
+        return
+
+    # ── Bash: styled output panel ──
+    if tool_name == "bash":
+        lines = result.split('\n')
+        output = "\n".join(lines[:12])
+        if len(lines) > 12:
+            output += f"\n\033[2m… {len(lines)-12} more lines\033[0m"
+        is_error = result.startswith("Error") or "error" in result[:100].lower() or "Traceback" in result[:100]
+        border = "red" if is_error else "yellow"
+        console.print(Panel(
+            output, border_style=border, padding=(0, 1),
+            title="[dim]output[/]" if not is_error else "[red]error[/]",
+            title_align="left",
+        ))
+        _auto_preview_images(result)
+        return
+
+    # ── Read file: compact preview ──
+    if tool_name == "read_file":
+        lines = result.split('\n')
+        output = "\n".join(lines[:10])
+        if len(lines) > 10:
+            output += f"\n… {len(lines)-10} more lines"
+        console.print(Panel(output, border_style="blue", padding=(0, 1),
+                            title="[dim]content[/]", title_align="left"))
+        return
+
+    # ── Default: truncated panel ──
     lines = result.split('\n')
     output = "\n".join(lines[:10])
     if len(lines) > 10:
-        output += f"\n... ({len(lines)-10} more lines)"
-    console.print(Panel(output, border_style="dim", padding=(0, 1), expand=True))
+        output += f"\n… ({len(lines)-10} more lines)"
+    console.print(Panel(output, border_style="dim", padding=(0, 1)))
 
     # Auto-preview any image files mentioned in tool output
     _auto_preview_images(result)
+
+
+def _show_search_results(result):
+    """Render web search results as styled cards with clickable links."""
+    # Parse header
+    header_match = re.match(r"(?:Image s|S)earch results for '([^']*)':", result)
+    query = header_match.group(1) if header_match else "search"
+
+    # Split into individual results
+    parts = result.split("\n\n")
+    entries = [e for e in (parts[1:] if len(parts) > 1 else parts) if e.strip()]
+
+    table = Table(
+        show_header=False, show_edge=False, pad_edge=False,
+        padding=(0, 1), expand=True, box=None,
+    )
+    table.add_column(ratio=1)
+
+    for i, entry in enumerate(entries[:5]):
+        entry = entry.strip()
+        if not entry:
+            continue
+
+        # Parse markdown-style [title](url)\nsnippet
+        md_match = re.match(r'\[([^\]]+)\]\(([^)]+)\)\n?(.*)', entry, re.DOTALL)
+        if md_match:
+            title, url, snippet = md_match.group(1), md_match.group(2), md_match.group(3).strip()
+        else:
+            # Image result format: "- Title\n  URL: ...\n  Source: ..."
+            lines = entry.split('\n')
+            title = lines[0].lstrip('- ').strip()
+            url = ""
+            snippet = ""
+            for line in lines[1:]:
+                if line.strip().startswith("URL:"):
+                    url = line.split("URL:", 1)[1].strip()
+                elif line.strip().startswith("Source:"):
+                    snippet = line.split("Source:", 1)[1].strip()
+
+        # Build styled entry
+        row = Text()
+        row.append(f"  {i+1}. ", style="bold cyan")
+        row.append(title, style="bold white")
+        row.append("\n")
+        if url:
+            # Shorten display URL
+            display_url = url.replace("https://", "").replace("http://", "")
+            if len(display_url) > 70:
+                display_url = display_url[:67] + "..."
+            row.append(f"     {display_url}", style="dim green")
+            row.append("\n")
+        if snippet:
+            row.append(f"     {snippet[:120]}", style="dim")
+
+        table.add_row(row)
+
+    title_text = Text()
+    title_text.append(" search ", style="bold magenta")
+    title_text.append(f'"{query}"', style="bold white")
+    title_text.append(f"  ({len(entries)} results)", style="dim")
+
+    console.print(Panel(
+        table,
+        title=title_text, title_align="left",
+        border_style="magenta",
+        padding=(0, 0),
+    ))
+
+
+def _show_fetch_result(result):
+    """Render fetch_url results with status and clean preview."""
+    lines = result.split('\n')
+    status_line = lines[0] if lines else ""
+
+    # Extract status code
+    status_match = re.search(r'Status:\s*(\d+)', status_line)
+    status = status_match.group(1) if status_match else "?"
+    status_style = "green" if status == "200" else "yellow"
+
+    # Content preview
+    content_lines = lines[1:]
+    preview = "\n".join(content_lines[:8])
+    if len(content_lines) > 8:
+        preview += f"\n... ({len(content_lines)-8} more lines)"
+
+    title_text = Text()
+    title_text.append(" fetch ", style="bold blue")
+    title_text.append(f"[{status}]", style=f"bold {status_style}")
+
+    console.print(Panel(
+        preview,
+        title=title_text, title_align="left",
+        border_style="blue",
+        padding=(0, 1),
+    ))
 
 def show_response(text):
     """Render model response as markdown with proper formatting.
@@ -1619,6 +1885,12 @@ class Permissions:
             f"[bold yellow]Allow [white]{fname}[/white]?[/]  [dim]y[/]es · [dim]n[/]o · [dim]a[/]lways",
             border_style="yellow", padding=(0, 1),
         ))
+        # Flush any leftover input from streaming
+        import termios
+        try:
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        except Exception:
+            pass
         try:
             ans = input("  ▸ ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -1628,9 +1900,24 @@ class Permissions:
             self._save_approved()
             console.print(f"  [green]✓ {fname} — always approved (remembered)[/]")
             return True
-        if ans in ("y", "yes", ""):
+        if ans in ("y", "yes"):
             console.print(f"  [green]✓ approved[/]")
             return True
+        if ans == "":
+            # Empty input — re-prompt, don't auto-approve
+            console.print(f"  [dim]Type y, n, or a[/]")
+            try:
+                ans = input("  ▸ ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return False
+            if ans in ("y", "yes"):
+                console.print(f"  [green]✓ approved[/]")
+                return True
+            if ans in ("a", "always"):
+                self.approved.add(fname)
+                self._save_approved()
+                console.print(f"  [green]✓ {fname} — always approved (remembered)[/]")
+                return True
         console.print(f"  [red]✗ denied[/]")
         return False
 
@@ -1645,7 +1932,7 @@ def agent_loop(messages, perms):
         spinner.start()
         spinner.update(tokens=total_tokens)
         try:
-            resp = chat_api(messages)
+            resp = chat_api(messages, spinner=spinner)
         except urllib.error.URLError:
             spinner.stop()
             console.print("[bold red]  ✗ API timeout — context full. Auto-clearing old messages.[/]")
@@ -1680,7 +1967,9 @@ def agent_loop(messages, perms):
         if not content_text and reasoning_text:
             content_text = reasoning_text
         content_text = re.sub(r'<\|?channel\|?>', '', content_text).strip()
-        if content_text:
+        # Text was already streamed live by chat_api — only show via
+        # markdown if it came from reasoning_content fallback
+        if content_text and not msg.get("content", "").strip():
             show_response(content_text)
 
         if not msg.get("tool_calls"):
@@ -1773,7 +2062,7 @@ def agent_loop(messages, perms):
                 logging.getLogger("localcoder").error(f"Tool error: {fname} → {e}")
                 console.print(f"  [bold red]✗ {e}[/]")
 
-            show_result(result)
+            show_result(result, fname)
 
             # Computer use results already include screen content from vision extraction
             # (built into the tool itself, ADK-style)
@@ -1827,7 +2116,15 @@ def agent_loop(messages, perms):
             max_len = 5000 if fname == "read_pdf" else 2500 if fname in ("fetch_url", "web_search") else 1500
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)[:max_len]})
 
-        console.print(f"  [dim]{tps:.0f} tok/s[/]")
+        tokens = usage.get("completion_tokens", 0) if usage else 0
+        stats = Text()
+        stats.append("  ")
+        if tokens:
+            stats.append(f"{tokens} tokens", style="dim")
+            stats.append(" · ", style="dim")
+        if tps > 0:
+            stats.append(f"{tps:.0f} tok/s", style="dim cyan")
+        console.print(stats)
 
     return total_tokens
 
@@ -2105,7 +2402,9 @@ def main(argv=None):
                    f"RULES:\n"
                    f"- After reading a file ONCE, do NOT re-read it\n"
                    f"- Write complete code with write_file, not code blocks in chat\n"
-                   f"- After each step, reflect: did this achieve what the user wanted?"
+                   f"- After each step, reflect: did this achieve what the user wanted?\n"
+                   f"- Be concise. Do NOT narrate your plan before acting. Just call the tool directly.\n"
+                   f"- Never say 'I will now...' or 'Let me...' — just do it."
     }
 
     # Auto-detect running model + load saved preference
@@ -2134,6 +2433,8 @@ def main(argv=None):
     shortcuts.append(" stats ", style="dim")
     shortcuts.append(" /clean ", style="bold white on #555555")
     shortcuts.append(" free ", style="dim")
+    shortcuts.append(" /think ", style="bold white on #555555")
+    shortcuts.append(" reason ", style="dim")
     shortcuts.append(" /models ", style="bold white on #555555")
     shortcuts.append(" switch ", style="dim")
     console.print(shortcuts)
@@ -2371,6 +2672,7 @@ def main(argv=None):
         "/bypass": "Approve everything",
         "/yolo": "Same as /bypass",
         "/log": "View debug log",
+        "/think": "Toggle reasoning: none → low → medium → high",
         "/exit": "Exit",
     }
 
@@ -2419,6 +2721,57 @@ def main(argv=None):
             console.print(f"  [green]Conversation cleared.[/]\n"); continue
         if task == "/cost":
             console.print(f"  [green]$0.00 — {total_tokens} tokens[/]"); continue
+        if task.startswith("/think"):
+            global REASONING_EFFORT
+            import tty, termios
+            levels = ["none", "low", "medium", "high"]
+            icons  = ["⚡", "💭", "🧠", "🔬"]
+            tags   = ["off", "light", "think", "deep"]
+            descs  = ["No thinking", "Quick reasoning", "Balanced", "Deep reasoning"]
+            idx = levels.index(REASONING_EFFORT) if REASONING_EFFORT in levels else 2
+
+            # ANSI colors
+            DIM = "\033[2m"
+            BOLD = "\033[1m"
+            REV = "\033[7m"  # reverse video (highlight)
+            RST = "\033[0m"
+
+            def _draw(i):
+                bar = f"  {icons[i]} "
+                for j in range(len(levels)):
+                    if j == i:
+                        bar += f" {REV}{BOLD} {tags[j]} {RST} "
+                    else:
+                        bar += f" {DIM} {tags[j]} {RST} "
+                bar += f" {DIM}{descs[i]}  ← → enter{RST}"
+                sys.stdout.write(f"\r\033[K{bar}")
+                sys.stdout.flush()
+
+            _draw(idx)
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                while True:
+                    ch = sys.stdin.read(1)
+                    if ch == '\r' or ch == '\n':
+                        break
+                    if ch == '\x1b':
+                        seq = sys.stdin.read(2)
+                        if seq == '[D':  # left
+                            idx = max(0, idx - 1)
+                        elif seq == '[C':  # right
+                            idx = min(len(levels) - 1, idx + 1)
+                    elif ch == 'q' or ch == '\x03':
+                        break
+                    _draw(idx)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+            REASONING_EFFORT = levels[idx]
+            sys.stdout.write(f"\r\033[K")
+            console.print(f"  {icons[idx]} Reasoning: [bold]{REASONING_EFFORT}[/] — {descs[idx]}")
+            continue
         if task == "/context":
             ctx_used = estimate_tokens(json.dumps(messages))
             ctx_str = BACKEND_INFO.get("ctx", "")

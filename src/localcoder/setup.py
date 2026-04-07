@@ -93,7 +93,7 @@ def wizard():
         fits = ram >= m["ram_required"]
         rec = " [green](recommended)[/]" if fits and mid == "gemma4-26b" and ram >= 24 else ""
         if not fits:
-            rec = " [red](needs {m['ram_required']}GB+)[/]"
+            rec = f" [red](needs {m['ram_required']}GB+)[/]"
         recommended.append((mid, m, fits, rec))
 
     for i, (mid, m, fits, rec) in enumerate(recommended):

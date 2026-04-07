@@ -339,12 +339,34 @@ def main():
             console.print("  [dim]No models found. Run: localcoder --setup[/]")
         return
 
-    # ── Ensure setup ──
+    # ── Ensure setup (skip when --api points to a running server) ──
     from localcoder.setup import ensure_setup, load_config
-    cfg = ensure_setup()
-    if not cfg:
-        console.print("  [dim]Setup cancelled.[/]")
-        return
+
+    if args.api:
+        # External server provided (e.g. from localfit --launch localcoder)
+        # Skip setup wizard — just verify server is reachable
+        import urllib.request
+        api_base = args.api.rstrip("/")
+        health_url = f"{api_base}/health"
+        try:
+            urllib.request.urlopen(health_url, timeout=3)
+        except Exception:
+            console.print(f"  [red]Server not reachable at {health_url}[/]")
+            console.print(f"  [dim]Start it first: localfit --serve <model>[/]")
+            return
+        # Build minimal config from CLI args
+        cfg = load_config() or {}
+        cfg["setup_complete"] = True
+        cfg["backend"] = "llamacpp"
+        cfg["api_base"] = api_base
+        if args.model:
+            cfg["model"] = args.model
+            cfg["model_id"] = args.model
+    else:
+        cfg = ensure_setup()
+        if not cfg:
+            console.print("  [dim]Setup cancelled.[/]")
+            return
 
     # ── Resolve config ──
     api_base = args.api or cfg.get("api_base", "http://127.0.0.1:8089/v1")
@@ -364,8 +386,8 @@ def main():
         backend_id = "ollama"
     elif args.api and "8089" in args.api:
         backend_id = "llamacpp"
-    # If user specified an Ollama-style model name, switch backend
-    if args.model and ":" in args.model:
+    # If user specified an Ollama-style model name, switch backend (only when no --api)
+    if args.model and ":" in args.model and not args.api:
         backend_id = "ollama"
         api_base = "http://127.0.0.1:11434/v1"
 
@@ -437,7 +459,7 @@ def main():
     )
     import time as _t
 
-    skip_boot = cfg.get("skip_boot_health", False)
+    skip_boot = cfg.get("skip_boot_health", False) or args.api
 
     if skip_boot:
         # Fast mode — one line
