@@ -1,35 +1,29 @@
-"""Agent runner — delegates to the localcoder agent script."""
-import os, sys
+"""Agent runner for the bundled localcoder agent module."""
+import os
 
 
 def run_agent(api_base, model, args):
     """Run the localcoder agent with the given config."""
+    from localcoder.localcoder_agent import main as agent_main
+
     os.environ["GEMMA_API_BASE"] = api_base
     os.environ["GEMMA_MODEL"] = model
 
-    # Find the agent script — bundled with the package
-    script = os.path.join(os.path.dirname(__file__), "localcoder_agent.py")
-    if not os.path.exists(script):
-        # Fallback
-        script = os.path.expanduser("~/Projects/gemma4-research/localcoder")
-
-    if not os.path.exists(script):
-        from rich.console import Console
-        Console().print("[red]Agent script not found.[/]")
-        return
-
-    cmd = [sys.executable, script]
+    argv = []
     if args.prompt:
-        cmd += ["-p", args.prompt]
+        argv += ["-p", args.prompt]
     if args.cont:
-        cmd += ["-c"]
+        argv += ["-c"]
     if args.model:
-        cmd += ["-m", model]
+        argv += ["-m", model]
     if args.yolo or args.bypass:
-        cmd += ["--yolo"]
+        argv += ["--yolo"]
     if args.ask:
-        cmd += ["--ask"]
+        argv += ["--ask"]
     if args.api:
-        cmd += ["--api", api_base]
+        argv += ["--api", api_base]
 
-    os.execvp(sys.executable, cmd)
+    if getattr(args, "unrestricted", False):
+        argv += ["--unrestricted"]
+
+    agent_main(argv)

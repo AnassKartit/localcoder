@@ -807,20 +807,8 @@ def main():
     os.environ["GEMMA_API_BASE"] = api_base
     os.environ["GEMMA_MODEL"] = model
 
-    # Import and run the original localcoder agent
-    # For now, exec the original script if it exists nearby
-    agent_script = os.path.join(os.path.dirname(__file__), "agent.py")
-    if os.path.exists(agent_script):
-        # Use the modular agent
-        from localcoder.agent import run_agent
-        run_agent(api_base, model, args)
-    else:
-        # Fallback: find the agent script
-        original = os.path.expanduser("~/Projects/gemma4-research/gemma4coder")
-        if os.path.exists(original):
-            os.execv(sys.executable, [sys.executable, original] + sys.argv[1:])
-        else:
-            console.print("  [red]Agent not found. Ensure localcoder agent.py is installed.[/]")
+    from localcoder.agent import run_agent
+    run_agent(api_base, model, args)
 
 
 if __name__ == "__main__":

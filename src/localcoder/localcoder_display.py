@@ -1,5 +1,5 @@
 """
-gemma4coder_display.py — Memory-safe animation and display system for gemma4coder.
+localcoder_display.py — Memory-safe animation and display system for localcoder.
 
 Uses rich.live for all animations (no background threads).
 All functions are standalone and can be dropped into the main script.
@@ -170,7 +170,7 @@ def show_startup_animation(console: Console, backend_info: dict) -> None:
 
     Total animation time < 500 ms.  Uses Live for smooth updates.
     """
-    banner_text = "gemma4coder"
+    banner_text = "localcoder"
     model_name = backend_info.get("model_name", "unknown")
     backend = backend_info.get("backend", "unknown")
     ctx = backend_info.get("ctx", "")
@@ -493,7 +493,7 @@ def context_usage_bar_compact(
 
 
 # ---------------------------------------------------------------------------
-# 6. CONVENIENCE: drop-in replacements for existing gemma4coder functions
+# 6. CONVENIENCE: drop-in replacements for existing localcoder functions
 # ---------------------------------------------------------------------------
 
 def print_thinking_live(

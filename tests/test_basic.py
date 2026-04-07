@@ -3,6 +3,8 @@ import os
 import sys
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -100,6 +102,38 @@ class TestBenchmark(unittest.TestCase):
             self.assertIn("prompt", t)
             self.assertIn("check", t)
             self.assertTrue(callable(t["check"]))
+
+
+class TestPackaging(unittest.TestCase):
+    """Test installed-package execution paths."""
+
+    def test_run_agent_uses_bundled_module(self):
+        from localcoder.agent import run_agent
+
+        args = SimpleNamespace(
+            prompt="fix the bug",
+            cont=True,
+            model="gemma4-26b",
+            yolo=False,
+            bypass=True,
+            ask=False,
+            api="http://127.0.0.1:8089/v1",
+            unrestricted=True,
+        )
+
+        with patch("localcoder.localcoder_agent.main") as agent_main:
+            run_agent("http://127.0.0.1:8089/v1", "gemma4-26b", args)
+
+        agent_main.assert_called_once_with([
+            "-p", "fix the bug",
+            "-c",
+            "-m", "gemma4-26b",
+            "--yolo",
+            "--api", "http://127.0.0.1:8089/v1",
+            "--unrestricted",
+        ])
+        self.assertEqual(os.environ["GEMMA_API_BASE"], "http://127.0.0.1:8089/v1")
+        self.assertEqual(os.environ["GEMMA_MODEL"], "gemma4-26b")
 
 
 class TestSandbox(unittest.TestCase):
