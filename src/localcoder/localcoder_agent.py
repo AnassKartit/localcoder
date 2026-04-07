@@ -2673,6 +2673,7 @@ def main(argv=None):
         "/yolo": "Same as /bypass",
         "/log": "View debug log",
         "/think": "Toggle reasoning: none → low → medium → high",
+        "/deploy": "Generate & deploy an AI-powered React app",
         "/exit": "Exit",
     }
 
@@ -2987,6 +2988,9 @@ def main(argv=None):
             continue
         if task in ("/exit", "/quit"):
             break
+        if task == "/deploy" or task.startswith("/deploy "):
+            _handle_deploy(task, messages, perms, system, console)
+            continue
 
         console.print(Rule(style="dim"))
 
@@ -3028,6 +3032,179 @@ def main(argv=None):
 
     # ── Exit: offer memory cleanup ──
     _cleanup_on_exit()
+
+
+def _handle_deploy(task, messages, perms, system, console):
+    """Generate and deploy an AI-powered React app."""
+    from rich.panel import Panel
+    from rich.rule import Rule
+
+    # Parse: /deploy or /deploy "description"
+    parts = task.split(None, 1)
+    description = parts[1] if len(parts) > 1 else None
+
+    console.print(f"\n  [bold #e07a5f]🚀 Deploy — AI App Generator[/]\n")
+
+    # App templates
+    TEMPLATES = {
+        "1": ("chatbot",  "AI Chatbot — conversational UI with streaming"),
+        "2": ("vision",   "Vision App — image upload + AI analysis"),
+        "3": ("writer",   "AI Writer — text rewriting, summarization, translation"),
+        "4": ("csv",      "Data Analyzer — upload CSV, get AI insights"),
+        "5": ("pdf",      "PDF Extractor — upload PDF, extract & summarize"),
+        "6": ("custom",   "Custom — describe your app"),
+    }
+
+    if not description:
+        console.print(f"  [bold]Pick a template:[/]\n")
+        for k, (tid, desc) in TEMPLATES.items():
+            console.print(f"  [bold cyan]{k}[/]  {desc}")
+        console.print()
+
+        try:
+            choice = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        if choice in TEMPLATES:
+            tid, desc = TEMPLATES[choice]
+            if tid == "custom":
+                try:
+                    description = input("  Describe your app: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                if not description:
+                    return
+            else:
+                description = desc
+        else:
+            description = choice  # treat as freeform description
+
+    # Get app name
+    try:
+        app_name = input(f"  App name [{description.split()[0].lower()}-app]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not app_name:
+        app_name = description.split()[0].lower().replace(" ", "-") + "-app"
+    app_name = re.sub(r'[^a-z0-9-]', '-', app_name.lower())
+
+    # Detect API endpoint
+    api_base = API_BASE.replace("/v1", "")
+
+    console.print(f"\n  [bold]App:[/] {app_name}")
+    console.print(f"  [bold]Desc:[/] {description}")
+    console.print(f"  [bold]Model API:[/] {api_base}/v1")
+    console.print(Rule(style="dim"))
+
+    # Build the generation prompt
+    deploy_system = f"""You are an expert full-stack React developer. Generate a COMPLETE, production-ready AI-powered web app.
+
+REQUIREMENTS:
+- Next.js 15 + TypeScript + Tailwind CSS
+- Beautiful, modern UI (dark theme, glassmorphism, smooth animations)
+- AI-powered backend using OpenAI-compatible API
+- All code must be COMPLETE — no placeholders, no TODOs, no "add your code here"
+- App must work immediately after `npm install && npm run dev`
+
+AI BACKEND PATTERN — use this exact pattern for all AI calls:
+```typescript
+// src/app/api/chat/route.ts (or similar)
+const response = await fetch(process.env.LLM_API_BASE + '/chat/completions', {{
+  method: 'POST',
+  headers: {{ 'Content-Type': 'application/json' }},
+  body: JSON.stringify({{
+    model: process.env.LLM_MODEL || 'local',
+    messages: [...],
+    stream: true,
+  }}),
+}});
+```
+
+ENV VARS (create .env.local):
+```
+LLM_API_BASE={api_base}/v1
+LLM_MODEL={MODEL}
+```
+
+This makes the app work with:
+- Local: llama-server on localhost:8089 (default)
+- Cloud: RunPod Serverless, OpenAI, Groq — just change LLM_API_BASE
+
+DIRECTORY STRUCTURE — create ALL files:
+{app_name}/
+  package.json
+  tsconfig.json
+  next.config.ts
+  tailwind.config.ts
+  postcss.config.mjs
+  .env.local
+  .env.example
+  src/app/layout.tsx
+  src/app/page.tsx
+  src/app/globals.css
+  src/app/api/chat/route.ts (or appropriate API route)
+  src/components/ (React components)
+  public/ (static assets if needed)
+
+IMPORTANT:
+1. Use write_file for EVERY file. Create the full directory.
+2. After writing all files, run: cd {app_name} && npm install
+3. Then show the user how to start: npm run dev
+4. Make the UI genuinely beautiful — not generic. Use gradients, shadows, animations.
+5. The app should feel like a polished product, not a tutorial demo."""
+
+    deploy_prompt = f"""Create a complete AI-powered React app:
+
+**App name:** {app_name}
+**Description:** {description}
+
+Generate ALL files now. Make it production-quality with a beautiful UI.
+After creating all files, run npm install to verify it works."""
+
+    # Fresh conversation for deploy
+    deploy_messages = [
+        {"role": "system", "content": deploy_system},
+        {"role": "user", "content": deploy_prompt},
+    ]
+
+    console.print(f"\n  [magenta]⚡[/] [bold]Generating {app_name}...[/]\n")
+
+    try:
+        tokens = agent_loop(deploy_messages, perms)
+    except KeyboardInterrupt:
+        console.print(f"\n  [yellow]Generation interrupted[/]")
+        return
+
+    # Check if app was created
+    app_dir = os.path.join(CWD, app_name)
+    if os.path.isdir(app_dir):
+        console.print(f"\n  [green]✓[/] App created: [bold]{app_dir}[/]")
+        console.print(f"\n  [bold]Run locally:[/]")
+        console.print(f"  [cyan]cd {app_name} && npm run dev[/]")
+        console.print(f"\n  [bold]Deploy options:[/]")
+        console.print(f"  [dim]Vercel:[/]   cd {app_name} && vercel")
+        console.print(f"  [dim]Coolify:[/]  git push (auto-deploy)")
+        console.print(f"  [dim]Docker:[/]   docker compose up")
+
+        # Offer to start dev server
+        console.print()
+        try:
+            ans = input("  Start dev server now? (y/n): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+
+        if ans in ("y", "yes"):
+            console.print(f"\n  [green]Starting {app_name} on http://localhost:3000...[/]\n")
+            try:
+                subprocess.run(
+                    "npm run dev",
+                    shell=True, cwd=app_dir,
+                )
+            except KeyboardInterrupt:
+                console.print(f"\n  [dim]Dev server stopped[/]")
+    else:
+        console.print(f"\n  [yellow]App directory not found. Check output above for errors.[/]")
 
 
 def _cleanup_on_exit():

@@ -206,5 +206,30 @@ class TestSandbox(unittest.TestCase):
         self.assertFalse(self._is_path_blocked("/tmp/test.py"))
 
 
+class TestDeploy(unittest.TestCase):
+    """Deploy command tests."""
+
+    def test_deploy_function_exists(self):
+        from localcoder.localcoder_agent import _handle_deploy
+        self.assertTrue(callable(_handle_deploy))
+
+    def test_deploy_in_slash_commands(self):
+        """Deploy should be registered as a slash command."""
+        import inspect
+        from localcoder.localcoder_agent import main
+        source = inspect.getsource(main)
+        self.assertIn("/deploy", source)
+
+    def test_deploy_templates(self):
+        """Deploy should support template types."""
+        import inspect
+        from localcoder.localcoder_agent import _handle_deploy
+        source = inspect.getsource(_handle_deploy)
+        self.assertIn("chatbot", source)
+        self.assertIn("vision", source)
+        self.assertIn("csv", source)
+        self.assertIn("custom", source)
+
+
 if __name__ == "__main__":
     unittest.main()
