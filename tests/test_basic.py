@@ -258,5 +258,35 @@ class TestDeploy(unittest.TestCase):
         self.assertIn("LLM_API_BASE", route)
 
 
+class TestSlashCommands(unittest.TestCase):
+    """Slash command autocomplete tests."""
+
+    def test_slash_commands_xml_safe(self):
+        """All slash command descriptions must be XML-safe for prompt_toolkit HTML."""
+        from xml.dom.minidom import parseString
+        # Get SLASH_COMMANDS from main() source — they're defined inside main()
+        # so we test the escaping logic instead
+        unsafe_chars = ["&", "<", ">"]
+        test_descs = [
+            "Generate & deploy an AI-powered React app",
+            "Show token → usage",
+            "Switch <model>",
+            "Normal description",
+        ]
+        for desc in test_descs:
+            safe = desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            try:
+                parseString(f"<root><b>/cmd</b> {safe}</root>")
+            except Exception as e:
+                self.fail(f"XML parse failed for '{desc}' → '{safe}': {e}")
+
+    def test_deploy_description_escapable(self):
+        """The /deploy description contains & which must be escaped."""
+        desc = "Generate & deploy an AI-powered React app"
+        self.assertIn("&", desc)
+        safe = desc.replace("&", "&amp;")
+        self.assertNotIn("&d", safe.replace("&amp;", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

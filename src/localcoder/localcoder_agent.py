@@ -2769,10 +2769,16 @@ def main(argv=None):
             if text.startswith("/"):
                 for cmd, desc in SLASH_COMMANDS.items():
                     if text.lower() in cmd.lower() or cmd.startswith(text):
+                        # Escape XML-invalid chars in description
+                        safe_desc = desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        try:
+                            display = PT_HTML_CMD(f'<b>{cmd}</b> <style fg="ansigray">{safe_desc}</style>')
+                        except Exception:
+                            display = f"{cmd} {desc}"
                         yield Completion(
                             cmd,
                             start_position=-len(text),
-                            display=PT_HTML_CMD(f'<b>{cmd}</b> <style fg="ansigray">{desc}</style>'),
+                            display=display,
                         )
 
     session = PromptSession(
