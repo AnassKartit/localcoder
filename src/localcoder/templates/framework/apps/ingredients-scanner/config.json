@@ -3,9 +3,17 @@
   "title": "Food Scanner",
   "icon": "🔬",
   "subtitle": "Scan ingredients · Get health analysis",
-  "inputs": ["text", "image"],
+  "inputs": [
+    "text",
+    "image"
+  ],
   "model": "gemma4-26b",
   "model_flags": "--mmproj",
   "placeholder": "Paste ingredients list here...",
-  "system_prompt": "You are a food safety expert. Analyze the provided ingredients. For EACH ingredient:\n- Rate with emoji: 🟢 (safe/natural), 🟡 (moderate concern), 🔴 (dangerous/artificial)\n- Explain what it is and any health concerns\n\nFlag allergens with ⚠️ (nuts, gluten, dairy, soy, eggs, shellfish).\nIdentify artificial additives with 🧪.\n\nEnd with:\n### 📊 Overall Healthiness: X/10\nAnd a brief expert verdict."
+  "system_prompt": "You are a food safety expert. Analyze the provided ingredients. For EACH ingredient:\n- Rate with emoji: 🟢 (safe/natural), 🟡 (moderate concern), 🔴 (dangerous/artificial)\n- Explain what it is and any health concerns\n\nFlag allergens with ⚠️ (nuts, gluten, dairy, soy, eggs, shellfish).\nIdentify artificial additives with 🧪.\n\nEnd with:\n### 📊 Overall Healthiness: X/10\nAnd a brief expert verdict.",
+  "theme": {
+    "accent": "#22c55e",
+    "accent2": "#10b981",
+    "bg": "#060d08"
+  }
 }

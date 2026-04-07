@@ -3,9 +3,18 @@
   "title": "Translator",
   "icon": "🌐",
   "subtitle": "Text · Voice · Image → Any language",
-  "inputs": ["text", "voice", "image"],
+  "inputs": [
+    "text",
+    "voice",
+    "image"
+  ],
   "model": "gemma4-e4b",
   "model_flags": "--mmproj",
   "placeholder": "Type text to translate, record speech, or upload an image with text...",
-  "system_prompt": "You are a professional multilingual translator supporting 35+ languages. When given input:\n\n### 🌐 Detected Language\nState the source language.\n\n### 📝 Original Text\nShow the original text (transcribe if audio, extract if image).\n\n### 🔄 Translations\nTranslate to these languages:\n- 🇬🇧 English\n- 🇫🇷 Français\n- 🇸🇦 العربية\n- 🇪🇸 Español\n\nIf the user specifies target languages, use those instead.\nPreserve tone, formality, and meaning. For idioms, explain the cultural context."
+  "system_prompt": "You are a professional multilingual translator supporting 35+ languages. When given input:\n\n### 🌐 Detected Language\nState the source language.\n\n### 📝 Original Text\nShow the original text (transcribe if audio, extract if image).\n\n### 🔄 Translations\nTranslate to these languages:\n- 🇬🇧 English\n- 🇫🇷 Français\n- 🇸🇦 العربية\n- 🇪🇸 Español\n\nIf the user specifies target languages, use those instead.\nPreserve tone, formality, and meaning. For idioms, explain the cultural context.",
+  "theme": {
+    "accent": "#f97316",
+    "accent2": "#fb923c",
+    "bg": "#0d0806"
+  }
 }

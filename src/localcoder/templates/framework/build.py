@@ -125,13 +125,42 @@ def build_app(app_id, output_dir):
     }'''
 
     # Build full HTML
+    # Per-app theme overrides
+    theme = cfg.get("theme", {})
+    accent = theme.get("accent", "#34d399")
+    accent2 = theme.get("accent2", "#2dd4bf")
+    bg = theme.get("bg", "#08080c")
+    theme_css = f"""
+    :root {{
+      --bg: {bg};
+      --accent: {accent};
+      --accent-dim: {accent}1f;
+      --accent-glow: {accent}0f;
+    }}
+    .app-title {{
+      background: linear-gradient(135deg, {accent}, {accent2});
+      -webkit-background-clip: text;
+      background-clip: text;
+    }}
+    .btn-primary {{
+      background: linear-gradient(135deg, {accent}, {accent2});
+      box-shadow: 0 2px 16px {accent}1f;
+    }}
+    .btn-primary:hover {{ box-shadow: 0 4px 24px {accent}33; }}
+    .result-area {{ border-left-color: {accent}; }}
+    .loading {{ color: {accent}; }}
+    .loading .spinner {{ border-top-color: {accent}; border-color: {accent}1f; border-top-color: {accent}; }}
+    .scanning::after {{ background: linear-gradient(90deg, transparent, {accent}, transparent); }}
+    body {{ background-color: {bg}; }}
+    """
+
     html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{cfg["title"]} {cfg["icon"]}</title>
-  <style>{css}</style>
+  <style>{css}{theme_css}</style>
 </head>
 <body>
   <div class="app-container">

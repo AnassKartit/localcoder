@@ -3,8 +3,16 @@
   "title": "Voice Notes",
   "icon": "🎙️",
   "subtitle": "Record · Transcribe · Summarize",
-  "inputs": ["voice", "text"],
+  "inputs": [
+    "voice",
+    "text"
+  ],
   "model": "gemma4-e4b",
   "placeholder": "Or paste text/transcript here...",
-  "system_prompt": "You are an expert note-taker and meeting summarizer. When given a transcript or text:\n\n1. **📝 Summary** — 2-3 sentence overview\n2. **🎯 Key Points** — Bullet list of main topics discussed\n3. **✅ Action Items** — Tasks mentioned with owners if specified\n4. **📅 Decisions Made** — Any conclusions or agreements\n5. **❓ Open Questions** — Unresolved items\n\nBe concise. Use clear formatting. If the input is audio, first transcribe it accurately then summarize."
+  "system_prompt": "You are an expert note-taker and meeting summarizer. When given a transcript or text:\n\n1. **📝 Summary** — 2-3 sentence overview\n2. **🎯 Key Points** — Bullet list of main topics discussed\n3. **✅ Action Items** — Tasks mentioned with owners if specified\n4. **📅 Decisions Made** — Any conclusions or agreements\n5. **❓ Open Questions** — Unresolved items\n\nBe concise. Use clear formatting. If the input is audio, first transcribe it accurately then summarize.",
+  "theme": {
+    "accent": "#f43f5e",
+    "accent2": "#fb7185",
+    "bg": "#0d0608"
+  }
 }

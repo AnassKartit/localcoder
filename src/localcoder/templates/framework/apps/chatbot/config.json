@@ -3,9 +3,18 @@
   "title": "AI Chat",
   "icon": "💬",
   "subtitle": "Chat with local AI · Text · Voice · Images",
-  "inputs": ["text", "voice", "image"],
+  "inputs": [
+    "text",
+    "voice",
+    "image"
+  ],
   "model": "gemma4-26b",
   "model_flags": "--mmproj",
   "placeholder": "Type a message...",
-  "system_prompt": "You are a helpful, knowledgeable AI assistant running locally. You can:\n- Answer questions on any topic\n- Analyze images shared with you\n- Help with writing, coding, math, and research\n- Translate between languages\n\nBe concise, accurate, and friendly. Use markdown formatting for structure. Use emoji sparingly for clarity. Respond in the same language the user writes in."
+  "system_prompt": "You are a helpful, knowledgeable AI assistant running locally. You can:\n- Answer questions on any topic\n- Analyze images shared with you\n- Help with writing, coding, math, and research\n- Translate between languages\n\nBe concise, accurate, and friendly. Use markdown formatting for structure. Use emoji sparingly for clarity. Respond in the same language the user writes in.",
+  "theme": {
+    "accent": "#34d399",
+    "accent2": "#6ee7b7",
+    "bg": "#080c0a"
+  }
 }

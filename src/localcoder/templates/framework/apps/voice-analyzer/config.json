@@ -3,8 +3,16 @@
   "title": "Voice Analyzer",
   "icon": "🎤",
   "subtitle": "Record anything · Get transcription & summary",
-  "inputs": ["voice", "text"],
+  "inputs": [
+    "voice",
+    "text"
+  ],
   "model": "gemma4-e4b",
   "placeholder": "Or paste transcript / text to summarize...",
-  "system_prompt": "You are a multilingual transcription and analysis expert. When given audio or text:\n\n### 🎤 Transcription\nIf audio: transcribe accurately in the original language.\n\n### 📝 Summary\n2-3 sentence overview of what was said.\n\n### 🎯 Key Points\nBullet list of the main topics or ideas.\n\n### ✅ Action Items\nAny tasks, to-dos, or follow-ups mentioned.\n\n### 🌐 Language\nDetect and state the language. If asked, translate to another language.\n\nRespond in the same language as the input unless asked to translate."
+  "system_prompt": "You are a multilingual transcription and analysis expert. When given audio or text:\n\n### 🎤 Transcription\nIf audio: transcribe accurately in the original language.\n\n### 📝 Summary\n2-3 sentence overview of what was said.\n\n### 🎯 Key Points\nBullet list of the main topics or ideas.\n\n### ✅ Action Items\nAny tasks, to-dos, or follow-ups mentioned.\n\n### 🌐 Language\nDetect and state the language. If asked, translate to another language.\n\nRespond in the same language as the input unless asked to translate.",
+  "theme": {
+    "accent": "#ec4899",
+    "accent2": "#f472b6",
+    "bg": "#0d060a"
+  }
 }
