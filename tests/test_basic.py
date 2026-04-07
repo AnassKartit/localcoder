@@ -221,14 +221,22 @@ class TestDeploy(unittest.TestCase):
         self.assertIn("/deploy", source)
 
     def test_deploy_templates(self):
-        """Deploy should support template types."""
+        """Deploy should load framework templates."""
         import inspect
         from localcoder.localcoder_agent import _handle_deploy
         source = inspect.getsource(_handle_deploy)
-        self.assertIn("chatbot", source)
-        self.assertIn("ingredients", source)
-        self.assertIn("code-review", source)
-        self.assertIn("custom", source)
+        self.assertIn("framework", source)
+        self.assertIn("build_app", source)
+        self.assertIn("list_apps", source)
+
+    def test_framework_apps_exist(self):
+        """Framework should have app configs."""
+        framework_dir = os.path.join(os.path.dirname(__file__), "..", "src", "localcoder", "templates", "framework", "apps")
+        apps = [d for d in os.listdir(framework_dir) if os.path.isfile(os.path.join(framework_dir, d, "config.json"))]
+        self.assertGreaterEqual(len(apps), 5)
+        self.assertIn("ingredients-scanner", apps)
+        self.assertIn("voice-memo", apps)
+        self.assertIn("chatbot", apps)
 
     def test_template_files_exist(self):
         """Template directory should contain all required files."""

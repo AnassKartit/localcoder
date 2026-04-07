@@ -3121,29 +3121,54 @@ def main(argv=None):
 
 
 def _handle_deploy(task, messages, perms, system, console):
-    """Generate and deploy an AI-powered React app from template."""
-    import shutil
+    """Build an AI app from the framework templates."""
     from rich.rule import Rule
 
+    # Load framework apps
+    framework_dir = os.path.join(os.path.dirname(__file__), "templates", "framework")
+    build_module = os.path.join(framework_dir, "build.py")
+
+    if not os.path.exists(build_module):
+        console.print(f"  [red]Framework not found[/]")
+        return
+
+    # Import builder
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("build", build_module)
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+
+    apps = builder.list_apps()
+    if not apps:
+        console.print(f"  [red]No app templates found[/]")
+        return
+
+    # Parse: /deploy or /deploy app-id or /deploy "description"
     parts = task.split(None, 1)
-    description = parts[1] if len(parts) > 1 else None
+    arg = parts[1].strip() if len(parts) > 1 else None
 
-    console.print(f"\n  [bold #e07a5f]🚀 Deploy — AI App Generator[/]\n")
-
-    # ── Templates: LLM only writes system prompt + page description ──
-    TEMPLATES = {
-        "1": ("chatbot",     "AI Chatbot",              "You are a helpful AI assistant. Be concise and friendly.",                        "Ask me anything..."),
-        "2": ("ingredients",  "Ingredients Analyzer",    "You are a food ingredients expert. When given a list of ingredients or a food product name, analyze each ingredient: explain what it is, whether it's natural or artificial, any health concerns, allergens, and give an overall healthiness rating from 1-10. Be specific and scientific but easy to understand.", "Paste ingredients list or food product name..."),
-        "3": ("writer",      "AI Writer",               "You are a professional writer. Rewrite, summarize, translate, or improve any text the user provides. Match the requested tone and style. Be creative but accurate.", "Paste text to rewrite, summarize, or translate..."),
-        "4": ("code-review", "Code Reviewer",           "You are a senior software engineer. Review the code provided: find bugs, security issues, performance problems, and suggest improvements. Be specific with line references. Rate code quality 1-10.", "Paste code to review..."),
-        "5": ("csv-analyzer","CSV Data Analyzer",       "You are a data analyst. When given CSV data, analyze it: identify patterns, outliers, trends, and provide summary statistics. Give actionable insights. Format numbers clearly.", "Paste CSV data or describe your dataset..."),
-        "6": ("custom",      "Custom App",              None, None),
-    }
-
-    if not description:
-        console.print(f"  [bold]Pick a template:[/]\n")
-        for k, (tid, title, _, _) in TEMPLATES.items():
-            console.print(f"  [bold cyan]{k}[/]  {title}")
+    # Direct app ID match
+    if arg and any(a['id'] == arg for a in apps):
+        selected = next(a for a in apps if a['id'] == arg)
+    elif arg:
+        # Fuzzy match or treat as custom description
+        matched = [a for a in apps if arg.lower() in a['id'] or arg.lower() in a.get('title', '').lower()]
+        if matched:
+            selected = matched[0]
+        else:
+            # Custom: use chatbot template with custom prompt
+            selected = next((a for a in apps if a['id'] == 'chatbot'), apps[0]).copy()
+            selected['title'] = arg[:40]
+            selected['subtitle'] = arg
+            selected['system_prompt'] = f"You are an AI expert for: {arg}. Help the user with detailed, accurate responses. Use emoji and structured formatting."
+    else:
+        # Interactive picker
+        console.print(f"\n  [bold #34d399]⚡ Deploy — AI App Framework[/]\n")
+        for i, a in enumerate(apps, 1):
+            inputs = ', '.join(a.get('inputs', []))
+            model = a.get('model', 'any')
+            console.print(f"  [bold cyan]{i}[/]  {a['icon']}  {a['title']:<20} [dim]{inputs:<18} {model}[/]")
+        console.print(f"  [bold cyan]{len(apps)+1}[/]  🛠️  Custom App")
         console.print()
 
         try:
@@ -3151,53 +3176,44 @@ def _handle_deploy(task, messages, perms, system, console):
         except (EOFError, KeyboardInterrupt):
             return
 
-        if choice in TEMPLATES:
-            tid, title, sys_prompt, placeholder = TEMPLATES[choice]
-            if tid == "custom":
+        try:
+            idx = int(choice) - 1
+            if idx == len(apps):
+                # Custom
                 try:
-                    description = input("  App description: ").strip()
-                    sys_prompt = input("  System prompt for AI: ").strip()
-                    placeholder = input("  Input placeholder: ").strip() or "Type here..."
-                    title = description.split(".")[0][:40]
+                    desc = input("  Describe your app: ").strip()
+                    if not desc:
+                        return
                 except (EOFError, KeyboardInterrupt):
                     return
-                if not description or not sys_prompt:
-                    return
+                selected = next((a for a in apps if a['id'] == 'chatbot'), apps[0]).copy()
+                selected['title'] = desc[:40]
+                selected['subtitle'] = desc
+                selected['system_prompt'] = f"You are an AI expert for: {desc}. Help the user. Use emoji and structured markdown."
+            elif 0 <= idx < len(apps):
+                selected = apps[idx]
             else:
-                description = title
-        else:
-            description = choice
-            sys_prompt = f"You are an AI assistant for: {choice}. Help the user with their request."
-            placeholder = "Type here..."
-            title = choice[:40]
+                return
+        except ValueError:
+            # Typed an app name
+            matched = [a for a in apps if choice.lower() in a['id'] or choice.lower() in a.get('title', '').lower()]
+            selected = matched[0] if matched else apps[0]
 
-    else:
-        # /deploy "ingredients analyzer"
-        title = description[:40]
-        sys_prompt = f"You are an AI expert for: {description}. Help the user with detailed, accurate responses."
-        placeholder = "Type here..."
-
-    # App name
+    # App output directory
+    default_name = selected['id']
     try:
-        default_name = re.sub(r'[^a-z0-9-]', '-', title.lower().replace(" ", "-"))
         app_name = input(f"  App name [{default_name}]: ").strip() or default_name
     except (EOFError, KeyboardInterrupt):
         return
     app_name = re.sub(r'[^a-z0-9-]', '-', app_name.lower())
     app_dir = os.path.join(CWD, app_name)
 
-    console.print(f"\n  [bold]App:[/]    {app_name}")
-    console.print(f"  [bold]Title:[/]  {title}")
-    console.print(f"  [bold]API:[/]    {API_BASE}")
+    console.print(f"\n  {selected['icon']}  [bold]{selected['title']}[/]")
+    console.print(f"  [dim]{selected.get('subtitle', '')}[/]")
+    console.print(f"  [dim]Inputs: {', '.join(selected.get('inputs', []))}  Model: {selected.get('model', 'any')}[/]")
     console.print(Rule(style="dim"))
 
-    # ── Copy template ──
-    template_dir = os.path.join(os.path.dirname(__file__), "templates", "ai-app")
-    if not os.path.isdir(template_dir):
-        console.print(f"  [red]Template not found: {template_dir}[/]")
-        return
-
-    console.print(f"  [dim]Scaffolding {app_name}...[/]")
+    # Build
     if os.path.exists(app_dir):
         try:
             ans = input(f"  {app_name}/ exists. Overwrite? (y/n): ").strip().lower()
@@ -3205,44 +3221,32 @@ def _handle_deploy(task, messages, perms, system, console):
             return
         if ans not in ("y", "yes"):
             return
+        import shutil
         shutil.rmtree(app_dir)
 
-    shutil.copytree(template_dir, app_dir)
+    console.print(f"  [dim]Building {app_name}...[/]")
 
-    # ── Fill in placeholders ──
-    api_base = API_BASE.replace("/v1", "")
-    replacements = {
-        "{{APP_NAME}}": app_name,
-        "{{APP_TITLE}}": title,
-        "{{APP_DESCRIPTION}}": description,
-        "{{SYSTEM_PROMPT}}": sys_prompt.replace("`", "\\`").replace("$", "\\$"),
-        "{{PLACEHOLDER}}": placeholder,
-    }
-
-    for root, dirs, files in os.walk(app_dir):
-        for fname in files:
-            fpath = os.path.join(root, fname)
-            if fname.endswith((".ts", ".tsx", ".json", ".css", ".mjs", ".local")):
-                try:
-                    content = open(fpath).read()
-                    for k, v in replacements.items():
-                        content = content.replace(k, v)
-                    with open(fpath, "w") as f:
-                        f.write(content)
-                except Exception:
-                    pass
-
-    # Fix .env.local with actual API base
-    env_path = os.path.join(app_dir, ".env.local")
-    env_content = open(env_path).read()
-    env_content = env_content.replace("http://localhost:8089/v1", f"{api_base}/v1")
-    with open(env_path, "w") as f:
-        f.write(env_content)
+    # Write custom config if modified
+    app_config_dir = os.path.join(framework_dir, "apps", selected['id'])
+    if selected.get('title') != next((a['title'] for a in apps if a['id'] == selected['id']), None):
+        # Custom app — write temp config
+        import json as _json, tempfile
+        tmp_app_dir = os.path.join(framework_dir, "apps", "_custom")
+        os.makedirs(tmp_app_dir, exist_ok=True)
+        with open(os.path.join(tmp_app_dir, "config.json"), "w") as f:
+            _json.dump(selected, f, indent=2)
+        try:
+            builder.build_app("_custom", app_dir)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_app_dir, ignore_errors=True)
+    else:
+        builder.build_app(selected['id'], app_dir)
 
     file_count = sum(len(files) for _, _, files in os.walk(app_dir))
     console.print(f"  [green]✓[/] Created {file_count} files in {app_name}/")
 
-    # ── npm install ──
+    # npm install
     console.print(f"  [dim]Installing dependencies...[/]")
     try:
         r = subprocess.run("npm install", shell=True, cwd=app_dir,
@@ -3250,34 +3254,24 @@ def _handle_deploy(task, messages, perms, system, console):
         if r.returncode == 0:
             console.print(f"  [green]✓[/] Dependencies installed")
         else:
-            console.print(f"  [yellow]npm install had warnings (may still work)[/]")
-    except subprocess.TimeoutExpired:
-        console.print(f"  [yellow]npm install timed out — run manually[/]")
-    except Exception as e:
-        console.print(f"  [red]npm install failed: {e}[/]")
+            console.print(f"  [yellow]npm install warnings (may still work)[/]")
+    except Exception:
+        console.print(f"  [yellow]npm install issue — run manually[/]")
 
-    # ── Summary ──
-    console.print(f"\n  [green bold]✓ {title} is ready![/]\n")
-    console.print(f"  [bold]Files:[/]")
-    console.print(f"    {app_name}/src/app/page.tsx          [dim]← UI[/]")
-    console.print(f"    {app_name}/src/app/api/ai/route.ts   [dim]← AI backend[/]")
-    console.print(f"    {app_name}/src/components/Chat.tsx    [dim]← chat component[/]")
-    console.print(f"    {app_name}/.env.local                [dim]← swap AI provider[/]")
-    console.print(f"\n  [bold]Run:[/]  cd {app_name} && npm run dev")
-    console.print(f"  [bold]Open:[/] http://localhost:3000")
-    console.print(f"\n  [bold]Deploy anywhere:[/]")
-    console.print(f"  [dim]vercel[/]     cd {app_name} && vercel")
-    console.print(f"  [dim]docker[/]     docker build -t {app_name} {app_name}/")
-    console.print(f"  [dim]coolify[/]    git push → auto-deploy")
-    console.print(f"\n  [bold]Switch AI backend:[/]  edit {app_name}/.env.local")
-    console.print(f"  [dim]Local:[/]     LLM_API_BASE=http://localhost:8089/v1")
-    console.print(f"  [dim]RunPod:[/]    LLM_API_BASE=https://api.runpod.ai/v2/ID/openai/v1")
-    console.print(f"  [dim]OpenAI:[/]    LLM_API_BASE=https://api.openai.com/v1")
+    # Summary
+    console.print(f"\n  [green bold]✓ {selected['icon']} {selected['title']} is ready![/]\n")
+    console.print(f"  [bold]Run:[/]     cd {app_name} && npm start")
+    console.print(f"  [bold]Open:[/]    http://localhost:3000")
+    console.print(f"\n  [bold]Switch AI provider:[/]")
+    console.print(f"  [dim]Local:[/]    LLM_API_BASE=http://localhost:8089/v1 npm start")
+    console.print(f"  [dim]OpenAI:[/]   LLM_API_BASE=https://api.openai.com/v1 LLM_API_KEY=sk-... npm start")
+    console.print(f"  [dim]Gemini:[/]   LLM_API_BASE=https://generativelanguage.googleapis.com/v1beta/openai LLM_API_KEY=... npm start")
+    console.print(f"  [dim]Groq:[/]     LLM_API_BASE=https://api.groq.com/openai/v1 LLM_API_KEY=... npm start")
 
-    # ── Start dev server? ──
+    # Start?
     console.print()
     try:
-        ans = input("  Start dev server? (y/n): ").strip().lower()
+        ans = input("  Start now? (y/n): ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         ans = "n"
 
@@ -3285,11 +3279,9 @@ def _handle_deploy(task, messages, perms, system, console):
         console.print(f"\n  [green]Starting on http://localhost:3000...[/]")
         console.print(f"  [dim]Ctrl+C to stop[/]\n")
         try:
-            subprocess.run("npm run dev", shell=True, cwd=app_dir)
+            subprocess.run("node server.js", shell=True, cwd=app_dir)
         except KeyboardInterrupt:
-            console.print(f"\n  [dim]Dev server stopped[/]")
-    else:
-        console.print(f"\n  [yellow]App directory not found. Check output above for errors.[/]")
+            console.print(f"\n  [dim]Server stopped[/]")
 
 
 def _cleanup_on_exit():
