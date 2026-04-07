@@ -3035,30 +3035,29 @@ def main(argv=None):
 
 
 def _handle_deploy(task, messages, perms, system, console):
-    """Generate and deploy an AI-powered React app."""
-    from rich.panel import Panel
+    """Generate and deploy an AI-powered React app from template."""
+    import shutil
     from rich.rule import Rule
 
-    # Parse: /deploy or /deploy "description"
     parts = task.split(None, 1)
     description = parts[1] if len(parts) > 1 else None
 
     console.print(f"\n  [bold #e07a5f]🚀 Deploy — AI App Generator[/]\n")
 
-    # App templates
+    # ── Templates: LLM only writes system prompt + page description ──
     TEMPLATES = {
-        "1": ("chatbot",  "AI Chatbot — conversational UI with streaming"),
-        "2": ("vision",   "Vision App — image upload + AI analysis"),
-        "3": ("writer",   "AI Writer — text rewriting, summarization, translation"),
-        "4": ("csv",      "Data Analyzer — upload CSV, get AI insights"),
-        "5": ("pdf",      "PDF Extractor — upload PDF, extract & summarize"),
-        "6": ("custom",   "Custom — describe your app"),
+        "1": ("chatbot",     "AI Chatbot",              "You are a helpful AI assistant. Be concise and friendly.",                        "Ask me anything..."),
+        "2": ("ingredients",  "Ingredients Analyzer",    "You are a food ingredients expert. When given a list of ingredients or a food product name, analyze each ingredient: explain what it is, whether it's natural or artificial, any health concerns, allergens, and give an overall healthiness rating from 1-10. Be specific and scientific but easy to understand.", "Paste ingredients list or food product name..."),
+        "3": ("writer",      "AI Writer",               "You are a professional writer. Rewrite, summarize, translate, or improve any text the user provides. Match the requested tone and style. Be creative but accurate.", "Paste text to rewrite, summarize, or translate..."),
+        "4": ("code-review", "Code Reviewer",           "You are a senior software engineer. Review the code provided: find bugs, security issues, performance problems, and suggest improvements. Be specific with line references. Rate code quality 1-10.", "Paste code to review..."),
+        "5": ("csv-analyzer","CSV Data Analyzer",       "You are a data analyst. When given CSV data, analyze it: identify patterns, outliers, trends, and provide summary statistics. Give actionable insights. Format numbers clearly.", "Paste CSV data or describe your dataset..."),
+        "6": ("custom",      "Custom App",              None, None),
     }
 
     if not description:
         console.print(f"  [bold]Pick a template:[/]\n")
-        for k, (tid, desc) in TEMPLATES.items():
-            console.print(f"  [bold cyan]{k}[/]  {desc}")
+        for k, (tid, title, _, _) in TEMPLATES.items():
+            console.print(f"  [bold cyan]{k}[/]  {title}")
         console.print()
 
         try:
@@ -3067,142 +3066,142 @@ def _handle_deploy(task, messages, perms, system, console):
             return
 
         if choice in TEMPLATES:
-            tid, desc = TEMPLATES[choice]
+            tid, title, sys_prompt, placeholder = TEMPLATES[choice]
             if tid == "custom":
                 try:
-                    description = input("  Describe your app: ").strip()
+                    description = input("  App description: ").strip()
+                    sys_prompt = input("  System prompt for AI: ").strip()
+                    placeholder = input("  Input placeholder: ").strip() or "Type here..."
+                    title = description.split(".")[0][:40]
                 except (EOFError, KeyboardInterrupt):
                     return
-                if not description:
+                if not description or not sys_prompt:
                     return
             else:
-                description = desc
+                description = title
         else:
-            description = choice  # treat as freeform description
+            description = choice
+            sys_prompt = f"You are an AI assistant for: {choice}. Help the user with their request."
+            placeholder = "Type here..."
+            title = choice[:40]
 
-    # Get app name
+    else:
+        # /deploy "ingredients analyzer"
+        title = description[:40]
+        sys_prompt = f"You are an AI expert for: {description}. Help the user with detailed, accurate responses."
+        placeholder = "Type here..."
+
+    # App name
     try:
-        app_name = input(f"  App name [{description.split()[0].lower()}-app]: ").strip()
+        default_name = re.sub(r'[^a-z0-9-]', '-', title.lower().replace(" ", "-"))
+        app_name = input(f"  App name [{default_name}]: ").strip() or default_name
     except (EOFError, KeyboardInterrupt):
         return
-    if not app_name:
-        app_name = description.split()[0].lower().replace(" ", "-") + "-app"
     app_name = re.sub(r'[^a-z0-9-]', '-', app_name.lower())
+    app_dir = os.path.join(CWD, app_name)
 
-    # Detect API endpoint
-    api_base = API_BASE.replace("/v1", "")
-
-    console.print(f"\n  [bold]App:[/] {app_name}")
-    console.print(f"  [bold]Desc:[/] {description}")
-    console.print(f"  [bold]Model API:[/] {api_base}/v1")
+    console.print(f"\n  [bold]App:[/]    {app_name}")
+    console.print(f"  [bold]Title:[/]  {title}")
+    console.print(f"  [bold]API:[/]    {API_BASE}")
     console.print(Rule(style="dim"))
 
-    # Build the generation prompt
-    deploy_system = f"""You are an expert full-stack React developer. Generate a COMPLETE, production-ready AI-powered web app.
-
-REQUIREMENTS:
-- Next.js 15 + TypeScript + Tailwind CSS
-- Beautiful, modern UI (dark theme, glassmorphism, smooth animations)
-- AI-powered backend using OpenAI-compatible API
-- All code must be COMPLETE — no placeholders, no TODOs, no "add your code here"
-- App must work immediately after `npm install && npm run dev`
-
-AI BACKEND PATTERN — use this exact pattern for all AI calls:
-```typescript
-// src/app/api/chat/route.ts (or similar)
-const response = await fetch(process.env.LLM_API_BASE + '/chat/completions', {{
-  method: 'POST',
-  headers: {{ 'Content-Type': 'application/json' }},
-  body: JSON.stringify({{
-    model: process.env.LLM_MODEL || 'local',
-    messages: [...],
-    stream: true,
-  }}),
-}});
-```
-
-ENV VARS (create .env.local):
-```
-LLM_API_BASE={api_base}/v1
-LLM_MODEL={MODEL}
-```
-
-This makes the app work with:
-- Local: llama-server on localhost:8089 (default)
-- Cloud: RunPod Serverless, OpenAI, Groq — just change LLM_API_BASE
-
-DIRECTORY STRUCTURE — create ALL files:
-{app_name}/
-  package.json
-  tsconfig.json
-  next.config.ts
-  tailwind.config.ts
-  postcss.config.mjs
-  .env.local
-  .env.example
-  src/app/layout.tsx
-  src/app/page.tsx
-  src/app/globals.css
-  src/app/api/chat/route.ts (or appropriate API route)
-  src/components/ (React components)
-  public/ (static assets if needed)
-
-IMPORTANT:
-1. Use write_file for EVERY file. Create the full directory.
-2. After writing all files, run: cd {app_name} && npm install
-3. Then show the user how to start: npm run dev
-4. Make the UI genuinely beautiful — not generic. Use gradients, shadows, animations.
-5. The app should feel like a polished product, not a tutorial demo."""
-
-    deploy_prompt = f"""Create a complete AI-powered React app:
-
-**App name:** {app_name}
-**Description:** {description}
-
-Generate ALL files now. Make it production-quality with a beautiful UI.
-After creating all files, run npm install to verify it works."""
-
-    # Fresh conversation for deploy
-    deploy_messages = [
-        {"role": "system", "content": deploy_system},
-        {"role": "user", "content": deploy_prompt},
-    ]
-
-    console.print(f"\n  [magenta]⚡[/] [bold]Generating {app_name}...[/]\n")
-
-    try:
-        tokens = agent_loop(deploy_messages, perms)
-    except KeyboardInterrupt:
-        console.print(f"\n  [yellow]Generation interrupted[/]")
+    # ── Copy template ──
+    template_dir = os.path.join(os.path.dirname(__file__), "templates", "ai-app")
+    if not os.path.isdir(template_dir):
+        console.print(f"  [red]Template not found: {template_dir}[/]")
         return
 
-    # Check if app was created
-    app_dir = os.path.join(CWD, app_name)
-    if os.path.isdir(app_dir):
-        console.print(f"\n  [green]✓[/] App created: [bold]{app_dir}[/]")
-        console.print(f"\n  [bold]Run locally:[/]")
-        console.print(f"  [cyan]cd {app_name} && npm run dev[/]")
-        console.print(f"\n  [bold]Deploy options:[/]")
-        console.print(f"  [dim]Vercel:[/]   cd {app_name} && vercel")
-        console.print(f"  [dim]Coolify:[/]  git push (auto-deploy)")
-        console.print(f"  [dim]Docker:[/]   docker compose up")
-
-        # Offer to start dev server
-        console.print()
+    console.print(f"  [dim]Scaffolding {app_name}...[/]")
+    if os.path.exists(app_dir):
         try:
-            ans = input("  Start dev server now? (y/n): ").strip().lower()
+            ans = input(f"  {app_name}/ exists. Overwrite? (y/n): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            ans = "n"
+            return
+        if ans not in ("y", "yes"):
+            return
+        shutil.rmtree(app_dir)
 
-        if ans in ("y", "yes"):
-            console.print(f"\n  [green]Starting {app_name} on http://localhost:3000...[/]\n")
-            try:
-                subprocess.run(
-                    "npm run dev",
-                    shell=True, cwd=app_dir,
-                )
-            except KeyboardInterrupt:
-                console.print(f"\n  [dim]Dev server stopped[/]")
+    shutil.copytree(template_dir, app_dir)
+
+    # ── Fill in placeholders ──
+    api_base = API_BASE.replace("/v1", "")
+    replacements = {
+        "{{APP_NAME}}": app_name,
+        "{{APP_TITLE}}": title,
+        "{{APP_DESCRIPTION}}": description,
+        "{{SYSTEM_PROMPT}}": sys_prompt.replace("`", "\\`").replace("$", "\\$"),
+        "{{PLACEHOLDER}}": placeholder,
+    }
+
+    for root, dirs, files in os.walk(app_dir):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            if fname.endswith((".ts", ".tsx", ".json", ".css", ".mjs", ".local")):
+                try:
+                    content = open(fpath).read()
+                    for k, v in replacements.items():
+                        content = content.replace(k, v)
+                    with open(fpath, "w") as f:
+                        f.write(content)
+                except Exception:
+                    pass
+
+    # Fix .env.local with actual API base
+    env_path = os.path.join(app_dir, ".env.local")
+    env_content = open(env_path).read()
+    env_content = env_content.replace("http://localhost:8089/v1", f"{api_base}/v1")
+    with open(env_path, "w") as f:
+        f.write(env_content)
+
+    file_count = sum(len(files) for _, _, files in os.walk(app_dir))
+    console.print(f"  [green]✓[/] Created {file_count} files in {app_name}/")
+
+    # ── npm install ──
+    console.print(f"  [dim]Installing dependencies...[/]")
+    try:
+        r = subprocess.run("npm install", shell=True, cwd=app_dir,
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            console.print(f"  [green]✓[/] Dependencies installed")
+        else:
+            console.print(f"  [yellow]npm install had warnings (may still work)[/]")
+    except subprocess.TimeoutExpired:
+        console.print(f"  [yellow]npm install timed out — run manually[/]")
+    except Exception as e:
+        console.print(f"  [red]npm install failed: {e}[/]")
+
+    # ── Summary ──
+    console.print(f"\n  [green bold]✓ {title} is ready![/]\n")
+    console.print(f"  [bold]Files:[/]")
+    console.print(f"    {app_name}/src/app/page.tsx          [dim]← UI[/]")
+    console.print(f"    {app_name}/src/app/api/ai/route.ts   [dim]← AI backend[/]")
+    console.print(f"    {app_name}/src/components/Chat.tsx    [dim]← chat component[/]")
+    console.print(f"    {app_name}/.env.local                [dim]← swap AI provider[/]")
+    console.print(f"\n  [bold]Run:[/]  cd {app_name} && npm run dev")
+    console.print(f"  [bold]Open:[/] http://localhost:3000")
+    console.print(f"\n  [bold]Deploy anywhere:[/]")
+    console.print(f"  [dim]vercel[/]     cd {app_name} && vercel")
+    console.print(f"  [dim]docker[/]     docker build -t {app_name} {app_name}/")
+    console.print(f"  [dim]coolify[/]    git push → auto-deploy")
+    console.print(f"\n  [bold]Switch AI backend:[/]  edit {app_name}/.env.local")
+    console.print(f"  [dim]Local:[/]     LLM_API_BASE=http://localhost:8089/v1")
+    console.print(f"  [dim]RunPod:[/]    LLM_API_BASE=https://api.runpod.ai/v2/ID/openai/v1")
+    console.print(f"  [dim]OpenAI:[/]    LLM_API_BASE=https://api.openai.com/v1")
+
+    # ── Start dev server? ──
+    console.print()
+    try:
+        ans = input("  Start dev server? (y/n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+
+    if ans in ("y", "yes"):
+        console.print(f"\n  [green]Starting on http://localhost:3000...[/]")
+        console.print(f"  [dim]Ctrl+C to stop[/]\n")
+        try:
+            subprocess.run("npm run dev", shell=True, cwd=app_dir)
+        except KeyboardInterrupt:
+            console.print(f"\n  [dim]Dev server stopped[/]")
     else:
         console.print(f"\n  [yellow]App directory not found. Check output above for errors.[/]")
 

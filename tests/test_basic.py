@@ -226,9 +226,28 @@ class TestDeploy(unittest.TestCase):
         from localcoder.localcoder_agent import _handle_deploy
         source = inspect.getsource(_handle_deploy)
         self.assertIn("chatbot", source)
-        self.assertIn("vision", source)
-        self.assertIn("csv", source)
+        self.assertIn("ingredients", source)
+        self.assertIn("code-review", source)
         self.assertIn("custom", source)
+
+    def test_template_files_exist(self):
+        """Template directory should contain all required files."""
+        template_dir = os.path.join(os.path.dirname(__file__), "..", "src", "localcoder", "templates", "ai-app")
+        self.assertTrue(os.path.isdir(template_dir), f"Template dir missing: {template_dir}")
+        required = ["package.json", "tsconfig.json", "next.config.ts", "postcss.config.mjs",
+                     ".env.local", "src/app/layout.tsx", "src/app/page.tsx",
+                     "src/app/globals.css", "src/app/api/ai/route.ts", "src/components/Chat.tsx"]
+        for f in required:
+            self.assertTrue(os.path.exists(os.path.join(template_dir, f)), f"Missing: {f}")
+
+    def test_template_has_placeholders(self):
+        """Template files should contain replaceable placeholders."""
+        template_dir = os.path.join(os.path.dirname(__file__), "..", "src", "localcoder", "templates", "ai-app")
+        page = open(os.path.join(template_dir, "src/app/page.tsx")).read()
+        self.assertIn("{{APP_TITLE}}", page)
+        route = open(os.path.join(template_dir, "src/app/api/ai/route.ts")).read()
+        self.assertIn("{{SYSTEM_PROMPT}}", route)
+        self.assertIn("LLM_API_BASE", route)
 
 
 if __name__ == "__main__":

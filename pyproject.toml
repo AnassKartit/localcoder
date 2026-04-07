@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "localcoder"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local AI coding agent — auto-installs, auto-serves, zero config. Works with Gemma 4, Qwen 3.5, and any model via llama.cpp or Ollama."
 readme = "README.md"
 license = "Apache-2.0"
