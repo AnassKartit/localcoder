@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;900&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#f0fdf4;--card:#fff;--primary:#10b981;--accent:#f97316;--wrong:#ef4444;--text:#1e293b;--dim:#94a3b8;--radius:20px}
+body{font-family:'Nunito',sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;display:flex;align-items:center;justify-content:center}
+.screen{display:none;flex-direction:column;align-items:center;gap:24px;padding:32px;max-width:480px;width:100%}
+.screen.active{display:flex}
+.card{background:var(--card);border-radius:var(--radius);padding:32px;width:100%;box-shadow:0 4px 24px rgba(0,0,0,0.06);text-align:center}
+h1{font-size:2.2rem;font-weight:900;color:var(--primary)}
+.subtitle{color:var(--dim);font-size:1rem;margin-top:4px}
+.btn{border:none;border-radius:14px;padding:16px 40px;font-size:1.1rem;font-weight:700;font-family:inherit;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff;box-shadow:0 4px 16px rgba(249,115,22,0.3)}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(249,115,22,0.4)}
+.btn-option{background:var(--card);border:2px solid #e2e8f0;width:100%;padding:14px;font-size:1.05rem;border-radius:14px}
+.btn-option:hover{border-color:var(--primary);background:#f0fdf4}
+.btn-option.correct{background:#d1fae5;border-color:var(--primary);animation:pop .3s}
+.btn-option.wrong{background:#fee2e2;border-color:var(--wrong);animation:shake .3s}
+@keyframes pop{0%{transform:scale(1)}50%{transform:scale(1.05)}100%{transform:scale(1)}}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
+.options{display:grid;grid-template-columns:1fr 1fr;gap:10px;width:100%}
+.visual{width:200px;height:200px;margin:0 auto}
+.score-bar{display:flex;align-items:center;gap:8px;font-size:1.1rem;font-weight:700}
+.stars{letter-spacing:4px;font-size:1.3rem}
+.progress{width:100%;height:6px;background:#e2e8f0;border-radius:99px;overflow:hidden}
+.progress-fill{height:100%;background:var(--primary);border-radius:99px;transition:width .3s}
+/* Confetti */
+.confetti-piece{position:fixed;width:10px;height:10px;border-radius:2px;animation:confetti-fall 1.5s ease-out forwards;pointer-events:none;z-index:999}
+@keyframes confetti-fall{0%{transform:translateY(-20px) rotate(0deg);opacity:1}100%{transform:translateY(100vh) rotate(720deg);opacity:0}}
+</style>
+</head>
+<body>
+
+<!-- START SCREEN -->
+<div id="start" class="screen active">
+  <div class="card">
+    <h1>{{ICON}} {{TITLE}}</h1>
+    <p class="subtitle">{{SUBTITLE}}</p>
+  </div>
+  <button class="btn btn-primary" onclick="startGame()">PLAY! ▶️</button>
+</div>
+
+<!-- GAME SCREEN -->
+<div id="game" class="screen">
+  <div class="score-bar">
+    <span id="scoreNum">0</span> pts
+    <span class="stars" id="stars"></span>
+  </div>
+  <div class="progress"><div class="progress-fill" id="progressBar" style="width:0%"></div></div>
+  <div class="card">
+    <div class="visual" id="visual">
+      <!-- SVG or visual goes here — agent customizes this -->
+      <svg viewBox="0 0 200 200" id="pieSvg"></svg>
+    </div>
+    <p id="question" style="margin-top:16px;font-size:1.15rem;font-weight:700">{{QUESTION_TEXT}}</p>
+  </div>
+  <div class="options" id="options">
+    <!-- Agent generates answer buttons dynamically -->
+  </div>
+</div>
+
+<!-- END SCREEN -->
+<div id="end" class="screen">
+  <div class="card">
+    <h1>🎉 Great Job!</h1>
+    <p style="font-size:1.3rem;margin:12px 0">Score: <strong id="finalScore">0</strong></p>
+    <p class="stars" id="finalStars"></p>
+  </div>
+  <button class="btn btn-primary" onclick="startGame()">Play Again 🔄</button>
+</div>
+
+<script>
+// ── CONFIG — Agent customizes these ──
+const TOTAL_QUESTIONS = 10;
+const QUESTION_TEXT = "{{QUESTION_TEXT}}";
+
+// ── STATE ──
+let score = 0, question = 0, correctAnswer = null;
+
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+function startGame() {
+  score = 0; question = 0;
+  document.getElementById('scoreNum').textContent = '0';
+  document.getElementById('stars').textContent = '';
+  document.getElementById('progressBar').style.width = '0%';
+  showScreen('game');
+  nextQuestion();
+}
+
+// ── VISUAL: SVG Pie Chart — draws fraction as colored slices ──
+function drawPie(numerator, denominator) {
+  const svg = document.getElementById('pieSvg');
+  svg.innerHTML = '';
+  const cx=100, cy=100, r=85;
+  // Background circle
+  const bg = document.createElementNS('http://www.w3.org/2000/svg','circle');
+  bg.setAttribute('cx',cx); bg.setAttribute('cy',cy); bg.setAttribute('r',r);
+  bg.setAttribute('fill','#f1f5f9'); bg.setAttribute('stroke','#cbd5e1'); bg.setAttribute('stroke-width','2');
+  svg.appendChild(bg);
+  // Draw slices
+  for (let i = 0; i < denominator; i++) {
+    const startAngle = (i * 360 / denominator - 90) * Math.PI / 180;
+    const endAngle = ((i+1) * 360 / denominator - 90) * Math.PI / 180;
+    const x1 = cx + r * Math.cos(startAngle);
+    const y1 = cy + r * Math.sin(startAngle);
+    const x2 = cx + r * Math.cos(endAngle);
+    const y2 = cy + r * Math.sin(endAngle);
+    const large = (360/denominator > 180) ? 1 : 0;
+    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d', `M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large},1 ${x2},${y2} Z`);
+    path.setAttribute('fill', i < numerator ? 'var(--primary)' : '#e2e8f0');
+    path.setAttribute('stroke', '#fff'); path.setAttribute('stroke-width', '2');
+    svg.appendChild(path);
+  }
+}
+
+// ── QUESTION GENERATOR — Agent customizes this function ──
+function generateQuestion() {
+  const denominators = [2, 3, 4, 5, 6, 8];
+  const d = denominators[Math.floor(Math.random() * denominators.length)];
+  const n = Math.floor(Math.random() * (d - 1)) + 1;
+  correctAnswer = `${n}/${d}`;
+  drawPie(n, d);
+  document.getElementById('question').textContent = QUESTION_TEXT;
+  // Generate 4 options (1 correct + 3 wrong)
+  const opts = new Set([correctAnswer]);
+  while (opts.size < 4) {
+    const wd = denominators[Math.floor(Math.random() * denominators.length)];
+    const wn = Math.floor(Math.random() * (wd - 1)) + 1;
+    opts.add(`${wn}/${wd}`);
+  }
+  const shuffled = [...opts].sort(() => Math.random() - 0.5);
+  const container = document.getElementById('options');
+  container.innerHTML = '';
+  shuffled.forEach(opt => {
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-option';
+    btn.textContent = opt;
+    btn.onclick = () => checkAnswer(btn, opt);
+    container.appendChild(btn);
+  });
+}
+
+function checkAnswer(btn, selected) {
+  document.querySelectorAll('.btn-option').forEach(b => b.disabled = true);
+  if (selected === correctAnswer) {
+    btn.classList.add('correct');
+    score++;
+    document.getElementById('scoreNum').textContent = score;
+    document.getElementById('stars').textContent = '⭐'.repeat(Math.floor(score / 2));
+    spawnConfetti();
+    playSound(800, 0.15);
+  } else {
+    btn.classList.add('wrong');
+    document.querySelectorAll('.btn-option').forEach(b => {
+      if (b.textContent === correctAnswer) b.classList.add('correct');
+    });
+    playSound(200, 0.2);
+  }
+  question++;
+  document.getElementById('progressBar').style.width = `${(question/TOTAL_QUESTIONS)*100}%`;
+  setTimeout(() => {
+    if (question >= TOTAL_QUESTIONS) endGame();
+    else nextQuestion();
+  }, 1200);
+}
+
+function nextQuestion() { generateQuestion(); }
+
+function endGame() {
+  document.getElementById('finalScore').textContent = `${score}/${TOTAL_QUESTIONS}`;
+  document.getElementById('finalStars').textContent = '⭐'.repeat(Math.floor(score / 2));
+  showScreen('end');
+}
+
+// ── CONFETTI ──
+function spawnConfetti() {
+  const colors = ['#10b981','#f97316','#3b82f6','#ec4899','#eab308'];
+  for (let i = 0; i < 30; i++) {
+    const el = document.createElement('div');
+    el.className = 'confetti-piece';
+    el.style.left = Math.random() * 100 + 'vw';
+    el.style.background = colors[Math.floor(Math.random()*colors.length)];
+    el.style.animationDelay = Math.random() * 0.5 + 's';
+    el.style.width = (Math.random()*8+6)+'px';
+    el.style.height = (Math.random()*8+6)+'px';
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 2000);
+  }
+}
+
+// ── SOUND ──
+function playSound(freq, dur) {
+  try {
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    const osc = ctx.createOscillator(); const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value = freq; gain.gain.value = 0.1;
+    osc.start(); osc.stop(ctx.currentTime + dur);
+  } catch(e) {}
+}
+</script>
+</body>
+</html>

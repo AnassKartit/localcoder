@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;900&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#fefce8;--card:#fff;--primary:#8b5cf6;--accent:#ec4899;--correct:#10b981;--text:#1e293b;--dim:#94a3b8;--radius:20px}
+body{font-family:'Nunito',sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;display:flex;align-items:center;justify-content:center}
+.app{max-width:440px;width:100%;padding:24px;display:flex;flex-direction:column;align-items:center;gap:20px}
+.header{text-align:center}
+h1{font-size:2rem;font-weight:900;color:var(--primary)}
+.subtitle{color:var(--dim);font-size:0.9rem;margin-top:4px}
+.score-row{display:flex;gap:16px;font-size:0.95rem;font-weight:700;color:var(--dim)}
+.score-row span{color:var(--text)}
+/* Flip card */
+.card-container{width:100%;height:280px;perspective:1000px;cursor:pointer}
+.card-inner{position:relative;width:100%;height:100%;transition:transform 0.6s cubic-bezier(.4,0,.2,1);transform-style:preserve-3d}
+.card-container.flipped .card-inner{transform:rotateY(180deg)}
+.card-front,.card-back{position:absolute;inset:0;backface-visibility:hidden;border-radius:var(--radius);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;box-shadow:0 4px 24px rgba(0,0,0,0.06)}
+.card-front{background:linear-gradient(135deg,#8b5cf6,#6366f1);color:#fff}
+.card-back{background:var(--card);transform:rotateY(180deg);border:2px solid #e2e8f0}
+.card-emoji{font-size:3rem;margin-bottom:12px}
+.card-text{font-size:1.6rem;font-weight:900;text-align:center}
+.card-hint{font-size:0.85rem;margin-top:8px;opacity:0.7}
+.card-answer{font-size:1.4rem;font-weight:700;color:var(--primary);text-align:center}
+.card-detail{font-size:0.9rem;color:var(--dim);margin-top:8px;text-align:center}
+/* Buttons */
+.btn-row{display:flex;gap:10px;width:100%}
+.btn{flex:1;border:none;border-radius:14px;padding:14px;font-size:1rem;font-weight:700;font-family:inherit;cursor:pointer;transition:all .15s}
+.btn-know{background:var(--correct);color:#fff}
+.btn-know:hover{transform:translateY(-2px)}
+.btn-again{background:#fee2e2;color:#ef4444}
+.btn-again:hover{transform:translateY(-2px)}
+.btn-primary{background:var(--accent);color:#fff;width:100%;padding:16px;font-size:1.1rem}
+.progress{width:100%;height:6px;background:#e2e8f0;border-radius:99px;overflow:hidden}
+.progress-fill{height:100%;background:var(--primary);border-radius:99px;transition:width .3s}
+.tap-hint{color:var(--dim);font-size:0.8rem;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:0.5}50%{opacity:1}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <h1>{{ICON}} {{TITLE}}</h1>
+    <p class="subtitle">{{SUBTITLE}}</p>
+  </div>
+
+  <div class="score-row">
+    <div>✅ Know: <span id="known">0</span></div>
+    <div>🔄 Again: <span id="again">0</span></div>
+    <div>📚 Left: <span id="left">0</span></div>
+  </div>
+
+  <div class="progress"><div class="progress-fill" id="progressBar" style="width:0%"></div></div>
+
+  <div class="card-container" id="flashcard" onclick="flipCard()">
+    <div class="card-inner">
+      <div class="card-front">
+        <div class="card-emoji" id="cardEmoji">📝</div>
+        <div class="card-text" id="cardFront">Loading...</div>
+        <div class="card-hint">Tap to flip</div>
+      </div>
+      <div class="card-back">
+        <div class="card-answer" id="cardBack">Answer</div>
+        <div class="card-detail" id="cardDetail"></div>
+      </div>
+    </div>
+  </div>
+
+  <p class="tap-hint" id="tapHint">👆 Tap the card to reveal</p>
+
+  <div class="btn-row" id="actions" style="display:none">
+    <button class="btn btn-again" onclick="markAgain()">🔄 Again</button>
+    <button class="btn btn-know" onclick="markKnown()">✅ Know It!</button>
+  </div>
+
+  <!-- End screen -->
+  <div id="endScreen" style="display:none;text-align:center">
+    <h1>🎉 All Done!</h1>
+    <p style="font-size:1.2rem;margin:12px 0">You knew <strong id="finalKnown">0</strong> out of <strong id="finalTotal">0</strong></p>
+    <button class="btn btn-primary" onclick="restart()">Study Again 🔄</button>
+  </div>
+</div>
+
+<script>
+// ── CARD DATA — Agent replaces this array ──
+const CARDS = [
+  { front: "Hello", back: "Bonjour", emoji: "👋", detail: "French greeting" },
+  { front: "Thank you", back: "Merci", emoji: "🙏", detail: "Express gratitude" },
+  { front: "Goodbye", back: "Au revoir", emoji: "👋", detail: "Farewell" },
+  { front: "Please", back: "S'il vous plaît", emoji: "🤲", detail: "Polite request" },
+  { front: "Yes", back: "Oui", emoji: "✅", detail: "Affirmative" },
+  { front: "No", back: "Non", emoji: "❌", detail: "Negative" },
+  { front: "Water", back: "Eau", emoji: "💧", detail: "Essential for life" },
+  { front: "Food", back: "Nourriture", emoji: "🍽️", detail: "Sustenance" },
+];
+
+let deck = [], known = 0, again = 0, current = null, isFlipped = false;
+
+function shuffle(arr) { return [...arr].sort(() => Math.random() - 0.5); }
+
+function restart() {
+  deck = shuffle(CARDS); known = 0; again = 0; isFlipped = false;
+  document.getElementById('endScreen').style.display = 'none';
+  document.getElementById('flashcard').style.display = '';
+  document.getElementById('tapHint').style.display = '';
+  updateUI(); showNext();
+}
+
+function updateUI() {
+  document.getElementById('known').textContent = known;
+  document.getElementById('again').textContent = again;
+  document.getElementById('left').textContent = deck.length;
+  const total = CARDS.length;
+  document.getElementById('progressBar').style.width = `${((total - deck.length)/total)*100}%`;
+}
+
+function showNext() {
+  if (deck.length === 0) { endGame(); return; }
+  current = deck.shift();
+  isFlipped = false;
+  document.getElementById('flashcard').classList.remove('flipped');
+  document.getElementById('cardEmoji').textContent = current.emoji;
+  document.getElementById('cardFront').textContent = current.front;
+  document.getElementById('cardBack').textContent = current.back;
+  document.getElementById('cardDetail').textContent = current.detail || '';
+  document.getElementById('actions').style.display = 'none';
+  document.getElementById('tapHint').style.display = '';
+  updateUI();
+}
+
+function flipCard() {
+  if (isFlipped) return;
+  isFlipped = true;
+  document.getElementById('flashcard').classList.add('flipped');
+  document.getElementById('actions').style.display = 'flex';
+  document.getElementById('tapHint').style.display = 'none';
+}
+
+function markKnown() { known++; updateUI(); showNext(); }
+function markAgain() { again++; deck.push(current); updateUI(); showNext(); }
+
+function endGame() {
+  document.getElementById('flashcard').style.display = 'none';
+  document.getElementById('tapHint').style.display = 'none';
+  document.getElementById('actions').style.display = 'none';
+  document.getElementById('finalKnown').textContent = known;
+  document.getElementById('finalTotal').textContent = CARDS.length;
+  document.getElementById('endScreen').style.display = '';
+}
+
+restart();
+</script>
+</body>
+</html>
