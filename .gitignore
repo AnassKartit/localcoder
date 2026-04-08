@@ -5,3 +5,16 @@ dist/
 build/
 .eggs/
 *.log
+uv.lock
+.venv/
+.webui_secret_key
+.localcoder-history.json
+.localcoder-input-history
+.localcoder-snapshots/
+node_modules/
+package-lock.json
+dist/
+build/
+*.egg-info/
+__pycache__/
+.pytest_cache/
