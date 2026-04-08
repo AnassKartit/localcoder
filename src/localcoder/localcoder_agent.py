@@ -919,57 +919,50 @@ def exec_tool(name, args):
             return f"Error: {e}"
     elif name == "web_search":
         query = args.get("query", "")
-        is_image_query = any(w in query.lower() for w in ['image', 'logo', 'photo', 'screenshot', 'picture', 'png', 'jpg', 'icon', 'wallpaper'])
+        is_image_query = any(w in query.lower() for w in ['image', 'logo', 'photo', 'screenshot', 'picture', 'png', 'jpg', 'icon', 'wallpaper', 'unsplash'])
 
-        # DDG Image search — returns direct downloadable URLs
+        # Image search via ddgs package
         if is_image_query:
             try:
-                q = urllib.parse.quote(query)
-                req = urllib.request.Request(f"https://duckduckgo.com/?q={q}", headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    html = resp.read().decode()
-                vqd = re.search(r'vqd="([^"]+)"', html)
-                if vqd:
-                    img_url = f"https://duckduckgo.com/i.js?l=us-en&o=json&q={q}&vqd={vqd.group(1)}&f=,,,,,&p=1"
-                    req2 = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req2, timeout=5) as resp2:
-                        data = json.loads(resp2.read())
-                    imgs = []
-                    for r in data.get("results", [])[:5]:
-                        imgs.append(f"- {r.get('title','')[:60]}\n  URL: {r.get('image','')}\n  Source: {r.get('source','')}")
-                    if imgs:
-                        # Auto-preview first image result inline
-                        first_img_url = data.get("results", [{}])[0].get("image", "")
-                        if first_img_url:
-                            try:
-                                show_image_url(first_img_url, max_width=50, max_height=12)
-                            except Exception:
-                                pass
-                        return f"Image search results for '{query}':\n\n" + "\n\n".join(imgs)
-            except:
-                pass  # fall through to regular search
+                from ddgs import DDGS
+                results = DDGS().images(query.replace('image', '').replace('unsplash', '').strip(), max_results=5)
+                imgs = []
+                for r in results:
+                    imgs.append(f"- {r.get('title','')[:60]}\n  URL: {r.get('image','')}\n  Thumbnail: {r.get('thumbnail','')}\n  Source: {r.get('url','')}")
+                if imgs:
+                    first_url = results[0].get('image', '') if results else ''
+                    if first_url:
+                        try:
+                            show_image_url(first_url, max_width=50, max_height=12)
+                        except Exception:
+                            pass
+                    return f"Image search results for '{query}':\n\n" + "\n\n".join(imgs)
+            except ImportError:
+                pass  # ddgs not installed, try unsplash fallback
+            except Exception:
+                pass
 
-        # Regular web search
-        year = time.strftime("%Y")
-        if not any(y in query for y in [year, str(int(year)-1)]):
-            query = f"{query} {time.strftime('%B %Y')}"
+            # Unsplash fallback (no API key, direct source URLs)
+            try:
+                kw = urllib.parse.quote(query.replace('image', '').replace('unsplash', '').strip())
+                imgs = []
+                for i in range(5):
+                    url = f"https://source.unsplash.com/random/800x600/?{kw}&sig={i}"
+                    imgs.append(f"- Unsplash image {i+1}\n  URL: {url}")
+                return f"Unsplash images for '{query}':\n\n" + "\n\n".join(imgs) + "\n\nUse these URLs directly in <img src='URL'> tags."
+            except Exception:
+                pass
+
+        # Regular web search via ddgs package
         try:
-            q = urllib.parse.quote(query)
-            url = f"https://html.duckduckgo.com/html/?q={q}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-            results = []
-            for m in re.finditer(r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</span>', html, re.DOTALL):
-                link, title, snippet = m.group(1), m.group(2), m.group(3)
-                title = re.sub(r'<[^>]+>', '', title).strip()
-                snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-                if 'uddg=' in link:
-                    link = urllib.parse.unquote(link.split('uddg=')[-1].split('&')[0])
-                results.append(f"[{title}]({link})\n{snippet}")
-                if len(results) >= 5:
-                    break
-            return f"Search results for '{query}':\n\n" + "\n\n".join(results) if results else f"No results for '{query}'"
+            from ddgs import DDGS
+            results = DDGS().text(query, max_results=5)
+            formatted = []
+            for r in results:
+                formatted.append(f"[{r.get('title','')}]({r.get('href','')})\n{r.get('body','')[:150]}")
+            return f"Search results for '{query}':\n\n" + "\n\n".join(formatted) if formatted else f"No results for '{query}'"
+        except ImportError:
+            return f"Search requires 'ddgs' package. Install: pip install ddgs"
         except Exception as e:
             return f"Search error: {e}"
     elif name == "computer_use":
