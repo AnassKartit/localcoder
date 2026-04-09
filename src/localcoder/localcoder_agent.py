@@ -1,8 +1,10 @@
 #!/usr/bin/env /opt/homebrew/bin/python3
 """localcoder — Claude Code-style CLI agent powered by local models."""
-import os, subprocess, sys, json, urllib.request, urllib.parse, time, re, argparse, logging, signal
 
-from rich.console import Console
+import os, subprocess, sys, json, urllib.request, urllib.parse, time, re, argparse, logging, signal, threading, random
+
+from rich import box
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
@@ -13,6 +15,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.document import Document
 
 from localcoder.localcoder_display import (
     ThinkingSpinner,
@@ -26,16 +29,539 @@ from localcoder.localcoder_display import (
 
 console = Console()
 
+# ── i18n ──────────────────────────────────────────────────────────────────────
+UI_LANG = os.environ.get("LOCALCODER_UI_LANG", "en")
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display as _bidi_get_display
+except Exception:
+    arabic_reshaper = None
+    _bidi_get_display = None
+
+_REASONING_LOCALIZATION_CACHE = {}
+_ARABIC_RUN_RE = re.compile(
+    r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]"
+    r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF"
+    r"\u064B-\u065F\u0670\u06D6-\u06ED\u200c\u200d"
+    r"\u061F\u060C\u061B\u066A-\u066D\s]*"
+)
+
+
+def _shape_arabic(text):
+    """Reshape Arabic text for correct terminal display.
+
+    Default to reshaping so Arabic remains readable even when terminal RTL
+    support is partial or disabled. Users can opt into native terminal shaping
+    by setting LOCALCODER_NATIVE_ARABIC=1.
+    """
+    if not text:
+        return text
+    native_pref = os.environ.get("LOCALCODER_NATIVE_ARABIC")
+    term_program = os.environ.get("TERM_PROGRAM", "")
+    term_name = os.environ.get("TERM", "")
+    terminal_supports_native = (
+        term_program in ("Apple_Terminal", "iTerm.app", "WezTerm")
+        or "kitty" in term_name
+        or "ghostty" in term_name
+    )
+    if native_pref == "1" or (native_pref != "0" and terminal_supports_native):
+        return f"\u2067{text}\u2069"
+    if not arabic_reshaper:
+        return text
+    try:
+        reshaped = arabic_reshaper.reshape(text)
+        if _bidi_get_display:
+            return _bidi_get_display(reshaped)
+        return reshaped
+    except Exception:
+        return text
+
+
+def _contains_arabic(text):
+    return bool(text and re.search(r"[\u0600-\u06FF]", text))
+
+
+def _contains_latin(text):
+    return bool(text and re.search(r"[A-Za-z]", text))
+
+
+def _shape_arabic_segments(text):
+    if not text or not _contains_arabic(text):
+        return text
+
+    def _repl(match):
+        return _shape_arabic(match.group(0))
+
+    return _ARABIC_RUN_RE.sub(_repl, text)
+
+
+def _display_text(text):
+    if not text:
+        return text
+    rendered = []
+    for line in text.splitlines():
+        if not _contains_arabic(line):
+            rendered.append(line)
+        elif _contains_latin(line):
+            # Mixed LTR/RTL lines render badly if the whole line is force-shaped.
+            rendered.append(_shape_arabic_segments(line))
+        else:
+            rendered.append(_shape_arabic(line))
+    return "\n".join(rendered)
+
+
+def _localize_reasoning_text(reasoning_text):
+    return (reasoning_text or "").strip()
+
+
+_IMAGE_BAD_HINTS = (
+    "ai",
+    "generated",
+    "logo",
+    "icon",
+    "avatar",
+    "emoji",
+    "sprite",
+    "sticker",
+    "thumbnail",
+    "thumb",
+    "banner",
+    "wallpaper",
+    "desktop-wallpaper",
+    "vector",
+    "illustration",
+    "drawing",
+    "clipart",
+    "stablediffusion",
+    "stable diffusion",
+    "midjourney",
+    "lexica",
+    "artstation",
+)
+_IMAGE_GOOD_HINTS = (
+    "photo",
+    "portrait",
+    "official",
+    "press",
+    "getty",
+    "reuters",
+    "afp",
+    "ap",
+    "apimages",
+    "wikimedia",
+    "commons",
+    "unsplash",
+    "pexels",
+    "flickr",
+    "biography",
+    "britannica",
+    "fifa",
+    "uefa",
+)
+
+
+def _clean_image_search_query(query):
+    cleaned = query or ""
+    for term in (
+        "image",
+        "images",
+        "photo",
+        "photos",
+        "picture",
+        "pictures",
+        "wallpaper",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "webp",
+        "real photo",
+        "official photo",
+        "صورة",
+        "صور",
+        "photo de",
+        "photo d'",
+    ):
+        cleaned = re.sub(rf"\b{re.escape(term)}\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or (query or "")
+
+
+def _rewrite_photo_search_query(query):
+    cleaned = _clean_image_search_query(query)
+    cleaned = re.sub(
+        r"^(show me|find me|give me|like|comme une?|montre(?:z)? moi|je veux|أرني|اعطني|أعطني)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^(une|un|des|la|le|les)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(de|d'|of|for|عن|ل|لك)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(portrait|headshot)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if re.match(r"^ل[\u0600-\u06FF]", cleaned):
+        cleaned = cleaned[1:]
+    lower = cleaned.lower()
+    if any(term in lower for term in ("logo", "illustration", "vector", "wallpaper")):
+        return cleaned
+    if any(term in lower for term in ("photo", "photos", "صورة", "صور")):
+        return f"{cleaned} real photo official press -wallpaper -portrait -headshot -ai -\"stable diffusion\""
+    return f"{cleaned} official press photo -wallpaper -portrait -headshot -ai -\"stable diffusion\""
+
+
+def _is_image_only_request(text):
+    cleaned = (text or "").strip()
+    if not cleaned or len(cleaned) > 180:
+        return False
+    lower = cleaned.lower()
+    has_image_intent = any(
+        token in lower
+        for token in (
+            "show me a photo",
+            "show me a picture",
+            "show me an image",
+            "find me a photo",
+            "photo of",
+            "image of",
+            "picture of",
+            "real photo of",
+            "montre moi une photo",
+            "photo de",
+            "image de",
+            "photo réelle",
+            "أرني صورة",
+            "أعطني صورة",
+            "صورة",
+            "صور",
+        )
+    )
+    has_build_intent = any(
+        token in lower
+        for token in (
+            "build",
+            "create",
+            "make a page",
+            "gallery",
+            "html",
+            "website",
+            "site",
+            "app",
+            "page web",
+            "crée",
+            "أنشئ",
+            "اصنع",
+            "صفحة",
+            "موقع",
+        )
+    )
+    return has_image_intent and not has_build_intent
+
+
+def _rank_image_candidate(url, title="", source=""):
+    text = " ".join([url or "", title or "", source or ""]).lower()
+    score = 0
+    if any(bad in text for bad in _IMAGE_BAD_HINTS):
+        score -= 50
+    if any(good in text for good in _IMAGE_GOOD_HINTS):
+        score += 20
+    if re.search(r"\.(png|jpe?g|webp|gif|bmp|svg)(\?|$)", url or "", re.I):
+        score += 10
+    if any(host in (url or "").lower() for host in ("images.", "img.", "media.", "cdn.")):
+        score += 3
+    if any(host in (url or "").lower() for host in ("pinterest.", "facebook.", "instagram.", "tiktok.")):
+        score -= 20
+    return score
+
+
+def _sort_image_candidates(candidates):
+    seen = set()
+    ranked = []
+    for candidate in candidates or []:
+        url = (candidate.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        ranked.append(
+            (
+                _rank_image_candidate(url, candidate.get("title", ""), candidate.get("source", "")),
+                candidate,
+            )
+        )
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [candidate for _, candidate in ranked]
+
+
+def _extract_image_candidates_from_text(text, source_url=""):
+    found = []
+    for url in re.findall(r"!\[[^\]]*\]\((https?://[^\)]+)\)", text or ""):
+        found.append({"url": url, "title": "", "source": source_url})
+    for url in re.findall(r'(https?://[^\s"\'<>()]+(?:png|jpg|jpeg|webp|gif|bmp|svg)(?:\?[^\s"\'<>()]*)?)', text or "", re.I):
+        found.append({"url": url, "title": "", "source": source_url})
+    return _sort_image_candidates(found)
+
+
+def _resolve_whisper_model(language, cfg=None):
+    cfg = cfg or {}
+    whisper_home = os.path.expanduser("~/.local/share/whisper")
+    env_specific = os.environ.get(f"LOCALCODER_WHISPER_MODEL_{(language or '').upper()}")
+    env_default = os.environ.get("LOCALCODER_WHISPER_MODEL")
+    cfg_specific = cfg.get(f"voice_whisper_model_{language}") if language else None
+    cfg_default = cfg.get("voice_whisper_model")
+
+    candidates = []
+    for item in (env_specific, cfg_specific, env_default, cfg_default):
+        if item:
+            candidates.append(os.path.expanduser(item))
+
+    if language == "ar":
+        candidates.extend(
+            [
+                os.path.join(whisper_home, "ggml-large-v3-turbo.bin"),
+                os.path.join(whisper_home, "ggml-large-v3.bin"),
+                os.path.join(whisper_home, "ggml-medium.bin"),
+                os.path.join(whisper_home, "ggml-small.bin"),
+                os.path.join(whisper_home, "ggml-base.bin"),
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                os.path.join(whisper_home, "ggml-medium.bin"),
+                os.path.join(whisper_home, "ggml-small.bin"),
+                os.path.join(whisper_home, "ggml-base.bin"),
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+# Centralized translation strings
+_STRINGS = {
+    # ── Banner ──
+    "banner_title": {"ar": "المبرمج المحلي", "fr": "LocalCoder"},
+    "banner_subtitle": {
+        "ar": "وكيل برمجة محلي بالذكاء الاصطناعي داخل الطرفية",
+        "fr": "Agent de programmation IA local dans le terminal",
+    },
+    "cmd_line": {"ar": "واجهة سطر الأوامر", "fr": "Interface en ligne de commande"},
+    "offline": {"ar": "✓ بدون إنترنت", "fr": "✓ hors ligne"},
+    "desc_line1": {
+        "ar": "اكتب واختبر وصحح الأكواد مباشرة من الطرفية.",
+        "fr": "Écrivez, testez et déboguez du code depuis votre terminal.",
+    },
+    "desc_line2": {
+        "ar": "يعمل 100% على GPU. بدون مفاتيح API. بدون سحابة. اكتب ? للمساعدة.",
+        "fr": "Tourne 100% sur votre GPU. Pas de clés API. Pas de cloud. Tapez ? pour aide.",
+    },
+    # ── Prompt ──
+    "prompt_label": {"ar": "رسالة", "fr": "message"},
+    # ── Hint bar ──
+    "voice": {"ar": "تسجيل", "fr": "voix"},
+    "image": {"ar": "صورة", "fr": "image"},
+    "stop_send": {"ar": "إيقاف + إرسال", "fr": "arrêt + envoi"},
+    "stats": {"ar": "حالة", "fr": "stats"},
+    "free": {"ar": "تحرير", "fr": "libérer"},
+    "reason": {"ar": "تفكير", "fr": "raisonner"},
+    "switch": {"ar": "تبديل", "fr": "changer"},
+    # ── Voice ──
+    "voice_not_avail": {
+        "ar": "الصوت غير متوفر. شغّل: localcoder --setup",
+        "fr": "Voix non disponible. Lancez: localcoder --setup",
+    },
+    "recording": {"ar": "جارٍ التسجيل...", "fr": "Enregistrement..."},
+    "press_ctrlr_stop": {
+        "ar": "اضغط Ctrl+R للإيقاف",
+        "fr": "appuyez Ctrl+R pour arrêter",
+    },
+    "transcribing": {"ar": "جارٍ التفريغ...", "fr": "Transcription..."},
+    "no_speech": {"ar": "لم يُكتشف كلام", "fr": "Aucune parole détectée"},
+    "mic_perm_needed": {
+        "ar": "يلزم إذن الميكروفون  ·  اضغط ctrl+r مرة أخرى",
+        "fr": "Permission micro requise · appuyez ctrl+r à nouveau",
+    },
+    "voice_setup_title": {"ar": "إعداد الإدخال الصوتي", "fr": "Configuration vocale"},
+    "voice_setup_sub": {"ar": "إعداد لمرة واحدة", "fr": "configuration unique"},
+    "voice_select_lang": {
+        "ar": "اختر لغة التحدث الرئيسية للإدخال الصوتي:",
+        "fr": "Choisissez votre langue principale pour la saisie vocale:",
+    },
+    "voice_lang_set": {"ar": "✓ لغة الصوت: {lang}", "fr": "✓ Langue vocale: {lang}"},
+    "voice_lang_change": {
+        "ar": "غيّرها في أي وقت بـ /voice-lang",
+        "fr": "Changez à tout moment avec /voice-lang",
+    },
+    # ── Session ──
+    "resumed_session": {
+        "ar": "✦ استئناف الجلسة ({n} رسائل)",
+        "fr": "✦ Session restaurée ({n} messages)",
+    },
+    "no_saved_session": {
+        "ar": "لا توجد جلسة محفوظة — بداية جديدة",
+        "fr": "Pas de session sauvegardée — nouveau départ",
+    },
+    "conversation_cleared": {"ar": "تم مسح المحادثة.", "fr": "Conversation effacée."},
+    # ── Approval ──
+    "allow_tool": {"ar": "السماح بـ {fname}؟", "fr": "Autoriser {fname} ?"},
+    "yes": {"ar": "نعم", "fr": "oui"},
+    "no": {"ar": "لا", "fr": "non"},
+    "always": {"ar": "دائماً", "fr": "toujours"},
+    "approved": {"ar": "✓ موافق", "fr": "✓ approuvé"},
+    "denied": {"ar": "✗ مرفوض", "fr": "✗ refusé"},
+    "type_yna": {"ar": "اكتب y أو n أو a", "fr": "Tapez y, n, ou a"},
+    # ── Thinking slider ──
+    "think_off": {"ar": "إيقاف", "fr": "off"},
+    "think_light": {"ar": "خفيف", "fr": "léger"},
+    "think_balanced": {"ar": "تفكير", "fr": "réfléchir"},
+    "think_deep": {"ar": "عميق", "fr": "profond"},
+    "think_desc_off": {"ar": "بدون تفكير", "fr": "Pas de réflexion"},
+    "think_desc_light": {"ar": "تفكير سريع", "fr": "Réflexion rapide"},
+    "think_desc_balanced": {"ar": "متوازن", "fr": "Équilibré"},
+    "think_desc_deep": {"ar": "تفكير عميق", "fr": "Réflexion profonde"},
+    # ── Sandbox ──
+    "unrestricted_warn": {
+        "ar": "⚠ وضع غير مقيد — الحماية معطلة. وصول كامل للنظام.",
+        "fr": "⚠ MODE NON RESTREINT — sandbox désactivé. Accès complet.",
+    },
+    "yolo_warn": {
+        "ar": "وضع الموافقة التلقائية. الحماية مفعلة.",
+        "fr": "Mode auto-approbation. Sandbox actif.",
+    },
+    # ── Exit / Cleanup ──
+    "bye": {"ar": "إلى اللقاء", "fr": "au revoir"},
+    "gpu_cleanup": {"ar": "تنظيف GPU", "fr": "Nettoyage GPU"},
+    "keep_running": {"ar": "إبقاء التشغيل", "fr": "garder"},
+    "unload_models": {"ar": "تفريغ النماذج", "fr": "décharger"},
+    "stop_all": {"ar": "إيقاف الكل", "fr": "tout arrêter"},
+    "keep": {"ar": "إبقاء", "fr": "garder"},
+    "no_models_loaded": {
+        "ar": "لا توجد نماذج محملة في GPU. إلى اللقاء!",
+        "fr": "Aucun modèle chargé. Au revoir !",
+    },
+    "keeping_loaded": {
+        "ar": "سيتم إبقاء النماذج محملة. إلى اللقاء!",
+        "fr": "Modèles conservés. Au revoir !",
+    },
+    "models_unloaded": {
+        "ar": "تم تفريغ جميع النماذج، ذاكرة GPU تم تحريرها",
+        "fr": "Tous les modèles déchargés, mémoire GPU libérée",
+    },
+    "ollama_unloaded": {
+        "ar": "تم تفريغ نماذج Ollama",
+        "fr": "Modèles Ollama déchargés",
+    },
+    "llama_stopped": {"ar": "تم إيقاف llama-server", "fr": "llama-server arrêté"},
+    # ── Slash commands ──
+    "cmd_switch_model": {
+        "ar": "تبديل النموذج (بحث تقريبي)",
+        "fr": "Changer de modèle (recherche floue)",
+    },
+    "cmd_set_model": {"ar": "تحديد النموذج بالاسم", "fr": "Définir le modèle par nom"},
+    "cmd_clear": {"ar": "مسح المحادثة", "fr": "Effacer la conversation"},
+    "cmd_gpu": {
+        "ar": "عرض ذاكرة GPU والنماذج",
+        "fr": "Afficher mémoire GPU et modèles",
+    },
+    "cmd_clean": {
+        "ar": "تحرير ذاكرة GPU (تفريغ النماذج الخاملة)",
+        "fr": "Libérer mémoire GPU (décharger modèles inactifs)",
+    },
+    "cmd_health": {"ar": "لوحة صحة GPU الكاملة", "fr": "Tableau de bord santé GPU"},
+    "cmd_resume": {
+        "ar": "استعادة الجلسة الأخيرة",
+        "fr": "Restaurer la dernière session",
+    },
+    "cmd_context": {
+        "ar": "عرض استخدام الرموز",
+        "fr": "Afficher utilisation des tokens",
+    },
+    "cmd_paste": {
+        "ar": "لصق صورة من الحافظة",
+        "fr": "Coller une image du presse-papiers",
+    },
+    "cmd_undo": {
+        "ar": "التراجع عن آخر تعديل",
+        "fr": "Annuler la dernière modification",
+    },
+    "cmd_snapshots": {"ar": "قائمة النسخ الاحتياطية", "fr": "Lister les sauvegardes"},
+    "cmd_diff": {"ar": "عرض التغييرات", "fr": "Afficher les changements"},
+    "cmd_cost": {
+        "ar": "عرض تكلفة الرموز ($0.00)",
+        "fr": "Afficher coût tokens ($0.00)",
+    },
+    "cmd_ask": {"ar": "السؤال قبل كل أداة", "fr": "Demander avant chaque outil"},
+    "cmd_auto": {
+        "ar": "موافقة تلقائية للأدوات الآمنة",
+        "fr": "Auto-approuver les outils sûrs",
+    },
+    "cmd_bypass": {"ar": "الموافقة على كل شيء", "fr": "Tout approuver"},
+    "cmd_yolo": {"ar": "مثل /bypass", "fr": "Comme /bypass"},
+    "cmd_log": {"ar": "عرض سجل التصحيح", "fr": "Voir le journal de débogage"},
+    "cmd_think": {
+        "ar": "تبديل التفكير: لا ← خفيف ← متوسط ← عميق",
+        "fr": "Basculer réflexion: non → léger → moyen → profond",
+    },
+    "cmd_deploy": {
+        "ar": "إنشاء ونشر تطبيق React بالذكاء الاصطناعي",
+        "fr": "Générer et déployer une app React IA",
+    },
+    "cmd_exit": {"ar": "خروج", "fr": "Quitter"},
+    # ── Prompt right-side hints ──
+    "hint_enter_send": {"ar": "إدخال للإرسال", "fr": "Entrée pour envoyer"},
+    "hint_think": {"ar": "/think للتفكير", "fr": "/think pour réfléchir"},
+    "hint_help": {"ar": "? للمساعدة", "fr": "? pour aide"},
+    # ── System prompt language instruction ──
+    "sys_lang_instruction": {
+        "ar": "أجب دائماً باللغة العربية. استخدم العربية في الردود الظاهرة للمستخدم مع الإبقاء على الأوامر والمسارات وأسماء الملفات كما هي عند الحاجة.",
+        "fr": "Réponds toujours en français. Utilise le français pour les réponses visibles tout en conservant les commandes, chemins et noms de fichiers si nécessaire.",
+    },
+}
+
+
+def _t(key, **kwargs):
+    """Get translated string by key. Falls back to English (the key itself or hardcoded)."""
+    entry = _STRINGS.get(key)
+    if entry:
+        text = entry.get(UI_LANG, "")
+        if text:
+            if UI_LANG == "ar":
+                text = _shape_arabic(text)
+            if kwargs:
+                text = text.format(**kwargs)
+            return text
+    # English fallback — return key as-is (caller provides English inline)
+    return ""
+
+
+def _ui(en, ar=None, fr=None):
+    """Inline translation helper — use _t() for keyed strings, this for one-offs."""
+    if UI_LANG == "ar" and ar:
+        return _shape_arabic(ar)
+    if UI_LANG == "fr" and fr:
+        return fr
+    return en
+
+
 # ── Config ──
 API_BASE = os.environ.get("GEMMA_API_BASE", "http://127.0.0.1:8089/v1")
 MODEL = os.environ.get("GEMMA_MODEL", "gemma4-26b")
 CWD = os.getcwd()
 REASONING_EFFORT = "medium"  # none, low, medium, high — toggle with /think
 
+
 # ── Backend detection ──
 def detect_backend():
     """Auto-detect backend type and model info from the API server."""
-    info = {"backend": "unknown", "model_name": MODEL, "quant": "", "size": "", "ctx": ""}
+    info = {
+        "backend": "unknown",
+        "model_name": MODEL,
+        "quant": "",
+        "size": "",
+        "ctx": "",
+    }
     try:
         # Check if it's Ollama (has /api/tags)
         if "11434" in API_BASE:
@@ -44,7 +570,9 @@ def detect_backend():
             info["backend"] = "llama.cpp"
 
         # Get model list from /models endpoint
-        req = urllib.request.Request(f"{API_BASE}/models", headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            f"{API_BASE}/models", headers={"Content-Type": "application/json"}
+        )
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
         models = data.get("data", [])
@@ -54,29 +582,67 @@ def detect_backend():
             info["model_name"] = mid
 
             # Parse quant from model ID (e.g. "gemma-4-26B-A4B-it-UD-Q3_K_XL")
-            for q in ["Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K_XL", "Q4_K_S", "Q4_K_M", "Q4_K_XL", "Q5_K_M", "Q6_K", "Q8_0", "BF16", "F16", "IQ3_S", "IQ4_XS"]:
-                if q.lower().replace("_", "") in mid.lower().replace("_", "").replace("-", ""):
+            for q in [
+                "Q2_K",
+                "Q3_K_S",
+                "Q3_K_M",
+                "Q3_K_L",
+                "Q3_K_XL",
+                "Q4_K_S",
+                "Q4_K_M",
+                "Q4_K_XL",
+                "Q5_K_M",
+                "Q6_K",
+                "Q8_0",
+                "BF16",
+                "F16",
+                "IQ3_S",
+                "IQ4_XS",
+            ]:
+                if q.lower().replace("_", "") in mid.lower().replace("_", "").replace(
+                    "-", ""
+                ):
                     info["quant"] = q
                     break
 
             # Parse model size
-            for s in ["e2b", "e4b", "26b", "27b", "31b", "12b", "8b", "4b", "2b", "1b", "70b"]:
+            for s in [
+                "e2b",
+                "e4b",
+                "26b",
+                "27b",
+                "31b",
+                "12b",
+                "8b",
+                "4b",
+                "2b",
+                "1b",
+                "70b",
+            ]:
                 if s in mid.lower().replace("-", ""):
                     info["size"] = s.upper()
                     break
 
         # Try to get context size from /props or /health
         try:
-            req2 = urllib.request.Request(f"{API_BASE.replace('/v1','')}/props", headers={"Content-Type": "application/json"})
+            req2 = urllib.request.Request(
+                f"{API_BASE.replace('/v1', '')}/props",
+                headers={"Content-Type": "application/json"},
+            )
             with urllib.request.urlopen(req2, timeout=2) as resp2:
                 props = json.loads(resp2.read())
             ctx = props.get("default_generation_settings", {}).get("n_ctx", 0)
             if ctx:
-                if ctx >= 131072: info["ctx"] = "128K"
-                elif ctx >= 65536: info["ctx"] = "64K"
-                elif ctx >= 32768: info["ctx"] = "32K"
-                elif ctx >= 16384: info["ctx"] = "16K"
-                else: info["ctx"] = f"{ctx//1024}K"
+                if ctx >= 131072:
+                    info["ctx"] = "128K"
+                elif ctx >= 65536:
+                    info["ctx"] = "64K"
+                elif ctx >= 32768:
+                    info["ctx"] = "32K"
+                elif ctx >= 16384:
+                    info["ctx"] = "16K"
+                else:
+                    info["ctx"] = f"{ctx // 1024}K"
         except:
             pass
 
@@ -84,9 +650,17 @@ def detect_backend():
         pass
     return info
 
-BACKEND_INFO = {"backend": "unknown", "model_name": MODEL, "quant": "", "size": "", "ctx": ""}
+
+BACKEND_INFO = {
+    "backend": "unknown",
+    "model_name": MODEL,
+    "quant": "",
+    "size": "",
+    "ctx": "",
+}
 
 CONFIG_FILE = os.path.expanduser("~/.localcoder/config.json")
+
 
 def _save_config(**kwargs):
     """Save config values to ~/.localcoder/config.json."""
@@ -102,6 +676,7 @@ def _save_config(**kwargs):
     except:
         pass
 
+
 def _load_config():
     """Load config from ~/.localcoder/config.json."""
     try:
@@ -112,16 +687,25 @@ def _load_config():
         pass
     return {}
 
+
 def _save_last_model(model, api_base):
-    _save_config(model=model, api_base=api_base, backend="ollama" if "11434" in api_base else "llamacpp")
+    _save_config(
+        model=model,
+        api_base=api_base,
+        backend="ollama" if "11434" in api_base else "llamacpp",
+    )
+
 
 def _check_permissions():
     """Check and guide user through macOS permissions on first run."""
     console.print()
-    console.print(Panel(
-        "[bold]macOS Permissions[/]  [dim]checking what Local Coder can access...[/]",
-        border_style="#81b29a", padding=(0, 1),
-    ))
+    console.print(
+        Panel(
+            "[bold]macOS Permissions[/]  [dim]checking what Local Coder can access...[/]",
+            border_style="#81b29a",
+            padding=(0, 1),
+        )
+    )
 
     PERMS = [
         {
@@ -160,15 +744,21 @@ def _check_permissions():
             granted = False
 
         if granted:
-            console.print(f"  [green]✓[/] [bold]{perm['name']}[/]  [dim]{perm['why']}[/]")
+            console.print(
+                f"  [green]✓[/] [bold]{perm['name']}[/]  [dim]{perm['why']}[/]"
+            )
         else:
             all_granted = False
             denied.append(perm)
-            console.print(f"  [yellow]○[/] [bold]{perm['name']}[/]  [dim]{perm['why']}[/]")
+            console.print(
+                f"  [yellow]○[/] [bold]{perm['name']}[/]  [dim]{perm['why']}[/]"
+            )
 
     if denied:
         console.print(f"\n  [yellow]Some permissions not granted yet.[/]")
-        console.print(f"  [dim]Local Coder works without them, but these features will be limited:[/]\n")
+        console.print(
+            f"  [dim]Local Coder works without them, but these features will be limited:[/]\n"
+        )
         for perm in denied:
             console.print(f"    [yellow]•[/] [bold]{perm['name']}[/]: {perm['why']}")
             console.print(f"      [dim]Fix: {perm['fix']}[/]")
@@ -177,8 +767,16 @@ def _check_permissions():
         try:
             ans = input("  ▸ ").strip().lower()
             if ans in ("y", "yes", ""):
-                subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy"], capture_output=True)
-                console.print(f"  [green]Opened System Settings.[/] Grant permissions, then restart Local Coder.")
+                subprocess.run(
+                    [
+                        "open",
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy",
+                    ],
+                    capture_output=True,
+                )
+                console.print(
+                    f"  [green]Opened System Settings.[/] Grant permissions, then restart Local Coder."
+                )
         except:
             pass
     else:
@@ -190,34 +788,70 @@ def _check_permissions():
 
 def _test_mic():
     import tempfile
+
     tmp = tempfile.mktemp(suffix=".wav")
     try:
-        r = subprocess.run(["rec", "-q", "-r", "16000", "-c", "1", "-b", "16", tmp, "trim", "0", "0.3"],
-            capture_output=True, timeout=5)
+        r = subprocess.run(
+            [
+                "rec",
+                "-q",
+                "-r",
+                "16000",
+                "-c",
+                "1",
+                "-b",
+                "16",
+                tmp,
+                "trim",
+                "0",
+                "0.3",
+            ],
+            capture_output=True,
+            timeout=5,
+        )
         return os.path.exists(tmp) and os.path.getsize(tmp) > 100
     finally:
-        if os.path.exists(tmp): os.unlink(tmp)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def _test_screen():
     import tempfile
+
     tmp = tempfile.mktemp(suffix=".png")
     try:
         subprocess.run(["screencapture", "-x", tmp], capture_output=True, timeout=5)
         return os.path.exists(tmp) and os.path.getsize(tmp) > 1000
     finally:
-        if os.path.exists(tmp): os.unlink(tmp)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def _test_accessibility():
-    r = subprocess.run(["osascript", "-e", 'tell application "System Events" to get name of first process'],
-        capture_output=True, text=True, timeout=5)
+    r = subprocess.run(
+        [
+            "osascript",
+            "-e",
+            'tell application "System Events" to get name of first process',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
     return r.returncode == 0
 
 
 def _test_automation():
-    r = subprocess.run(["osascript", "-e", 'tell application "System Events" to get picture of desktop 1'],
-        capture_output=True, text=True, timeout=5)
+    r = subprocess.run(
+        [
+            "osascript",
+            "-e",
+            'tell application "System Events" to get picture of desktop 1',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
     return r.returncode == 0
 
 
@@ -229,7 +863,9 @@ def _switch_model(new_model, new_url):
     # Check if this model is already running on its backend
     is_running = False
     try:
-        req = urllib.request.Request(f"{new_url}/models", headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            f"{new_url}/models", headers={"Content-Type": "application/json"}
+        )
         with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read())
         running_ids = [m.get("id", "").lower() for m in data.get("data", [])]
@@ -243,7 +879,9 @@ def _switch_model(new_model, new_url):
         API_BASE = new_url
         BACKEND_INFO.update(detect_backend())
         _save_last_model(MODEL, API_BASE)
-        console.print(f"  [green]✓ Switched to [bold]{MODEL}[/] on {BACKEND_INFO['backend']}[/]")
+        console.print(
+            f"  [green]✓ Switched to [bold]{MODEL}[/] on {BACKEND_INFO['backend']}[/]"
+        )
         return
 
     # Model is downloaded but not running — need to load it
@@ -291,11 +929,31 @@ def _switch_model(new_model, new_url):
     if not os.path.exists(binary):
         binary = _shutil.which("llama-server") or binary
 
-    cmd = [binary, "-m", gguf_path, "--port", "8089",
-           "-ngl", "99", "-c", "131072", "-np", "1",
-           "-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0",
-           "--no-warmup", "--cache-ram", "0", "--jinja",
-           "--reasoning-budget", "0"]
+    cmd = [
+        binary,
+        "-m",
+        gguf_path,
+        "--port",
+        "8089",
+        "-ngl",
+        "99",
+        "-c",
+        "131072",
+        "-np",
+        "1",
+        "-fa",
+        "on",
+        "-ctk",
+        "q4_0",
+        "-ctv",
+        "q4_0",
+        "--no-warmup",
+        "--cache-ram",
+        "0",
+        "--jinja",
+        "--reasoning-budget",
+        "0",
+    ]
     if mmproj:
         cmd += ["--mmproj", mmproj]
     else:
@@ -323,7 +981,9 @@ def _switch_model(new_model, new_url):
         API_BASE = "http://127.0.0.1:8089/v1"
         BACKEND_INFO.update(detect_backend())
         _save_last_model(MODEL, API_BASE)
-        console.print(f"  [green]✓ Switched to [bold]{MODEL}[/] on llama.cpp ({BACKEND_INFO.get('ctx', '?')})[/]")
+        console.print(
+            f"  [green]✓ Switched to [bold]{MODEL}[/] on llama.cpp ({BACKEND_INFO.get('ctx', '?')})[/]"
+        )
     else:
         console.print(f"  [red]Server failed to start in 60s[/]")
 
@@ -345,8 +1005,10 @@ def _load_last_model():
 
     # 2. Auto-detect: if llama-server is running, use whatever model it has loaded
     try:
-        req = urllib.request.Request("http://127.0.0.1:8089/v1/models",
-            headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            "http://127.0.0.1:8089/v1/models",
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read())
         running = [m.get("id", "") for m in data.get("data", [])]
@@ -359,8 +1021,10 @@ def _load_last_model():
 
     # 3. Fallback: check Ollama
     try:
-        req = urllib.request.Request("http://127.0.0.1:11434/api/ps",
-            headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            "http://127.0.0.1:11434/api/ps",
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read())
         loaded = [m.get("name", "") for m in data.get("models", [])]
@@ -370,11 +1034,13 @@ def _load_last_model():
     except:
         pass
 
+
 # ── Multi-backend discovery ──
 BACKENDS = [
     {"name": "llama.cpp", "url": "http://127.0.0.1:8089/v1", "type": "llamacpp"},
     {"name": "Ollama", "url": "http://127.0.0.1:11434/v1", "type": "ollama"},
 ]
+
 
 def discover_all_models():
     """Discover models from running backends + downloaded GGUFs."""
@@ -384,19 +1050,29 @@ def discover_all_models():
     # 1. Running models from backends
     for backend in BACKENDS:
         try:
-            req = urllib.request.Request(f"{backend['url']}/models", headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(
+                f"{backend['url']}/models", headers={"Content-Type": "application/json"}
+            )
             with urllib.request.urlopen(req, timeout=2) as resp:
                 data = json.loads(resp.read())
             for m in data.get("data", []):
                 mid = m.get("id", "")
                 if mid:
-                    all_models.append({"id": mid, "backend": backend["name"], "url": backend["url"], "status": "running"})
+                    all_models.append(
+                        {
+                            "id": mid,
+                            "backend": backend["name"],
+                            "url": backend["url"],
+                            "status": "running",
+                        }
+                    )
                     seen.add(mid.lower())
         except:
             pass
 
     # 2. Downloaded GGUFs in HuggingFace cache (available for llama.cpp)
     import glob
+
     hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
     for gguf in glob.glob(f"{hf_cache}/models--*/snapshots/*/*.gguf"):
         name = os.path.basename(gguf)
@@ -404,17 +1080,20 @@ def discover_all_models():
             continue
         if name.lower() not in seen:
             size_gb = os.path.getsize(gguf) / (1024**3)
-            all_models.append({
-                "id": name,
-                "backend": "llama.cpp",
-                "url": "http://127.0.0.1:8089/v1",
-                "status": "downloaded",
-                "path": gguf,
-                "size_gb": round(size_gb, 1),
-            })
+            all_models.append(
+                {
+                    "id": name,
+                    "backend": "llama.cpp",
+                    "url": "http://127.0.0.1:8089/v1",
+                    "status": "downloaded",
+                    "path": gguf,
+                    "size_gb": round(size_gb, 1),
+                }
+            )
             seen.add(name.lower())
 
     return all_models
+
 
 def select_model_interactive():
     """Interactive model selector with fuzzy search autocomplete."""
@@ -429,10 +1108,13 @@ def select_model_interactive():
 
     # Display with styled backend grouping
     console.print()
-    console.print(Panel(
-        "[bold]Select Model[/]  [dim]type to search · enter to select · esc to cancel[/]",
-        border_style="#81b29a", padding=(0, 1),
-    ))
+    console.print(
+        Panel(
+            "[bold]Select Model[/]  [dim]type to search · enter to select · esc to cancel[/]",
+            border_style="#81b29a",
+            padding=(0, 1),
+        )
+    )
 
     by_backend = {}
     for m in models:
@@ -467,11 +1149,17 @@ def select_model_interactive():
                 label = m["id"]
                 if text in label.lower() or not text:
                     status = m.get("status", "running")
-                    tag = '<style fg="ansigreen">running</style>' if status == "running" else '<style fg="ansiyellow">downloaded</style>'
+                    tag = (
+                        '<style fg="ansigreen">running</style>'
+                        if status == "running"
+                        else '<style fg="ansiyellow">downloaded</style>'
+                    )
                     yield Completion(
                         label,
                         start_position=-len(document.text_before_cursor),
-                        display=PT_HTML(f'<b>{label}</b> <style fg="ansigray">{m["backend"]}</style> {tag}'),
+                        display=PT_HTML(
+                            f'<b>{label}</b> <style fg="ansigray">{m["backend"]}</style> {tag}'
+                        ),
                     )
 
     try:
@@ -481,26 +1169,74 @@ def select_model_interactive():
         # Get system RAM for recommendations
         try:
             if sys.platform == "darwin":
-                _ram = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3).stdout.strip()) // (1024**3)
+                _ram = int(
+                    subprocess.run(
+                        ["sysctl", "-n", "hw.memsize"],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                    ).stdout.strip()
+                ) // (1024**3)
             else:
                 with open("/proc/meminfo") as _f:
                     for _l in _f:
                         if _l.startswith("MemTotal:"):
-                            _ram = int(_l.split()[1]) // (1024 * 1024); break
+                            _ram = int(_l.split()[1]) // (1024 * 1024)
+                            break
         except:
             _ram = 24
         metal_gb = int(_ram * 0.67)
 
         # Benchmark data from our tests (tok/s on M4 Pro 24GB)
         BENCHMARKS = {
-            "gemma-4-26b-a4b-it-ud-q3_k_xl": {"tok_s": 49, "gpu_gb": 13.6, "quality": "★★★★★", "note": "Best overall on 24GB"},
-            "qwen3.5-35b-a3b-ud-q2_k_xl": {"tok_s": 49, "gpu_gb": 12.0, "quality": "★★★★☆", "note": "More code detail"},
-            "qwen3.5-4b-ud-q4_k_xl": {"tok_s": 50, "gpu_gb": 2.7, "quality": "★★★☆☆", "note": "Ultrafast, basic tasks"},
-            "gemma-4-e4b-it-q4_k_m": {"tok_s": 38, "gpu_gb": 9.6, "quality": "★★★★☆", "note": "Audio + image"},
-            "gemma4:e4b": {"tok_s": 38, "gpu_gb": 9.6, "quality": "★★★★☆", "note": "Audio + image"},
-            "gemma4:e2b": {"tok_s": 57, "gpu_gb": 7.2, "quality": "★★☆☆☆", "note": "Speed demon"},
-            "gemma4:26b": {"tok_s": 9, "gpu_gb": 16.8, "quality": "★★★★★", "note": "Slow on 24GB (swap)"},
-            "qwen3.5:27b": {"tok_s": 5, "gpu_gb": 16.2, "quality": "★★★★☆", "note": "Dense — swap thrashing"},
+            "gemma-4-26b-a4b-it-ud-q3_k_xl": {
+                "tok_s": 49,
+                "gpu_gb": 13.6,
+                "quality": "★★★★★",
+                "note": "Best overall on 24GB",
+            },
+            "qwen3.5-35b-a3b-ud-q2_k_xl": {
+                "tok_s": 49,
+                "gpu_gb": 12.0,
+                "quality": "★★★★☆",
+                "note": "More code detail",
+            },
+            "qwen3.5-4b-ud-q4_k_xl": {
+                "tok_s": 50,
+                "gpu_gb": 2.7,
+                "quality": "★★★☆☆",
+                "note": "Ultrafast, basic tasks",
+            },
+            "gemma-4-e4b-it-q4_k_m": {
+                "tok_s": 38,
+                "gpu_gb": 9.6,
+                "quality": "★★★★☆",
+                "note": "Audio + image",
+            },
+            "gemma4:e4b": {
+                "tok_s": 38,
+                "gpu_gb": 9.6,
+                "quality": "★★★★☆",
+                "note": "Audio + image",
+            },
+            "gemma4:e2b": {
+                "tok_s": 57,
+                "gpu_gb": 7.2,
+                "quality": "★★☆☆☆",
+                "note": "Speed demon",
+            },
+            "gemma4:26b": {
+                "tok_s": 9,
+                "gpu_gb": 16.8,
+                "quality": "★★★★★",
+                "note": "Slow on 24GB (swap)",
+            },
+            "qwen3.5:27b": {
+                "tok_s": 5,
+                "gpu_gb": 16.2,
+                "quality": "★★★★☆",
+                "note": "Dense — swap thrashing",
+            },
         }
 
         # Build choices with recommendations
@@ -517,7 +1253,8 @@ def select_model_interactive():
                 # Fuzzy match
                 for bk, bv in BENCHMARKS.items():
                     if bk in bench_key or bench_key in bk:
-                        bench = bv; break
+                        bench = bv
+                        break
 
             gpu = bench.get("gpu_gb", m.get("size_gb", 0))
             fits = gpu and gpu < metal_gb
@@ -567,7 +1304,8 @@ def select_model_interactive():
             if not bench:
                 for bk, bv in BENCHMARKS.items():
                     if bk in bench_key or bench_key in bk:
-                        bench = bv; break
+                        bench = bv
+                        break
             is_current = 0 if (m["id"] == MODEL and m["url"] == API_BASE) else 1
             is_running = 0 if m.get("status") == "running" else 1
             speed = -(bench.get("tok_s", 0))
@@ -575,21 +1313,24 @@ def select_model_interactive():
 
         choices.sort(key=_sort_key)
 
-        dialog_style = PTStyle.from_dict({
-            "dialog": "bg:#1a1a2e",
-            "dialog.body": "bg:#1a1a2e #e0e0e0",
-            "dialog frame.label": "bg:#e07a5f #ffffff bold",
-            "dialog shadow": "bg:#000000",
-            "radiolist": "bg:#1a1a2e",
-            "button": "bg:#81b29a #000000 bold",
-            "button.focused": "bg:#e07a5f #ffffff bold",
-        })
+        dialog_style = PTStyle.from_dict(
+            {
+                "dialog": "bg:#1a1a2e",
+                "dialog.body": "bg:#1a1a2e #e0e0e0",
+                "dialog frame.label": "bg:#e07a5f #ffffff bold",
+                "dialog shadow": "bg:#000000",
+                "radiolist": "bg:#1a1a2e",
+                "button": "bg:#81b29a #000000 bold",
+                "button.focused": "bg:#e07a5f #ffffff bold",
+            }
+        )
 
         # Add disk space info
         disk_free = "?"
         hf_cache = "?"
         try:
             from localcoder.backends import get_disk_info
+
             di = get_disk_info()
             disk_free = f"{di['disk_free_gb']}GB"
             hf_cache = f"{di['hf_cache_gb']}GB"
@@ -598,18 +1339,37 @@ def select_model_interactive():
 
         # Add separator + trending models (live from HuggingFace)
         try:
-            from localcoder.backends import fetch_unsloth_top_models, fetch_hf_trending_models
+            from localcoder.backends import (
+                fetch_unsloth_top_models,
+                fetch_hf_trending_models,
+            )
+
             # Separator
             sep_entry = {"id": "__sep_trending__", "url": ""}
-            choices.append((sep_entry, "  ─── Trending (live from HuggingFace) ───────────────────"))
+            choices.append(
+                (
+                    sep_entry,
+                    "  ─── Trending (live from HuggingFace) ───────────────────",
+                )
+            )
 
             trending = fetch_unsloth_top_models(limit=6)
             for t in trending:
-                if any(t["label"].lower().replace("-","") in c[0]["id"].lower().replace("-","") for c in choices):
+                if any(
+                    t["label"].lower().replace("-", "")
+                    in c[0]["id"].lower().replace("-", "")
+                    for c in choices
+                ):
                     continue
                 dl = t["downloads"]
-                dl_str = f"{dl // 1000}K" if dl < 1_000_000 else f"{dl / 1_000_000:.1f}M"
-                entry = {"id": t["repo_id"], "url": "hf_download", "hf_repo": t["repo_id"]}
+                dl_str = (
+                    f"{dl // 1000}K" if dl < 1_000_000 else f"{dl / 1_000_000:.1f}M"
+                )
+                entry = {
+                    "id": t["repo_id"],
+                    "url": "hf_download",
+                    "hf_repo": t["repo_id"],
+                }
                 label = f"  ★ {t['label']:<30}  {dl_str} dl  → download + install"
                 choices.append((entry, label))
 
@@ -619,13 +1379,25 @@ def select_model_interactive():
             liked = [l for l in liked if l["repo_id"] not in trending_repos][:4]
             if liked:
                 sep2 = {"id": "__sep_liked__", "url": ""}
-                choices.append((sep2, "  ─── Most liked ────────────────────────────────────────"))
+                choices.append(
+                    (sep2, "  ─── Most liked ────────────────────────────────────────")
+                )
                 for lm in liked:
-                    if any(lm["label"].lower().replace("-","") in c[0]["id"].lower().replace("-","") for c in choices):
+                    if any(
+                        lm["label"].lower().replace("-", "")
+                        in c[0]["id"].lower().replace("-", "")
+                        for c in choices
+                    ):
                         continue
                     dl = lm["downloads"]
-                    dl_str = f"{dl // 1000}K" if dl < 1_000_000 else f"{dl / 1_000_000:.1f}M"
-                    entry = {"id": lm["repo_id"], "url": "hf_download", "hf_repo": lm["repo_id"]}
+                    dl_str = (
+                        f"{dl // 1000}K" if dl < 1_000_000 else f"{dl / 1_000_000:.1f}M"
+                    )
+                    entry = {
+                        "id": lm["repo_id"],
+                        "url": "hf_download",
+                        "hf_repo": lm["repo_id"],
+                    }
                     label = f"  ♥ {lm['label']:<30}  {dl_str} dl  → download + install"
                     choices.append((entry, label))
         except Exception:
@@ -648,6 +1420,7 @@ def select_model_interactive():
                 console.print(f"\n  [bold]Fetching quants for {repo}...[/]")
                 try:
                     from localcoder.backends import simulate_hf_model
+
                     simulate_hf_model(repo)
                 except Exception as e:
                     console.print(f"  [red]{e}[/]")
@@ -666,7 +1439,7 @@ def select_model_interactive():
         except (EOFError, KeyboardInterrupt):
             return None, None
 
-    if not choice or choice.lower() in ('q', 'quit', 'esc'):
+    if not choice or choice.lower() in ("q", "quit", "esc"):
         return None, None
 
     # Exact match
@@ -682,14 +1455,16 @@ def select_model_interactive():
     console.print(f"  [red]Not found: {choice}[/]")
     return None, None
 
+
 # ── Clipboard paste ──
 def get_clipboard_image():
     """Get image from macOS clipboard, save to temp file, return path."""
     try:
         # Check if clipboard has image data
         r = subprocess.run(
-            ["osascript", "-e", 'the clipboard as «class PNGf»'],
-            capture_output=True, timeout=3
+            ["osascript", "-e", "the clipboard as «class PNGf»"],
+            capture_output=True,
+            timeout=3,
         )
         if r.returncode != 0:
             return None
@@ -697,11 +1472,19 @@ def get_clipboard_image():
         # Save clipboard image via Python
         tmp = os.path.join(CWD, ".localcoder-clipboard.png")
         subprocess.run(
-            ["osascript", "-e", f'set f to open for access POSIX file "{tmp}" with write permission',
-             "-e", 'set eof f to 0',
-             "-e", 'write (the clipboard as «class PNGf») to f',
-             "-e", 'close access f'],
-            capture_output=True, timeout=5
+            [
+                "osascript",
+                "-e",
+                f'set f to open for access POSIX file "{tmp}" with write permission',
+                "-e",
+                "set eof f to 0",
+                "-e",
+                "write (the clipboard as «class PNGf») to f",
+                "-e",
+                "close access f",
+            ],
+            capture_output=True,
+            timeout=5,
         )
         if os.path.isfile(tmp) and os.path.getsize(tmp) > 100:
             return tmp
@@ -709,21 +1492,130 @@ def get_clipboard_image():
         pass
     return None
 
+
 # ── Tools ──
 TOOLS = [
-    {"type":"function","function":{"name":"bash","description":"Run any shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}},
-    {"type":"function","function":{"name":"write_file","description":"Create or overwrite a file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
-    {"type":"function","function":{"name":"read_file","description":"Read a file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
-    {"type":"function","function":{"name":"edit_file","description":"Find and replace text in a file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}}},
-    {"type":"function","function":{"name":"web_search","description":"Search the web via DuckDuckGo.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
-    {"type":"function","function":{"name":"fetch_url","description":"Fetch a URL and return status + body.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
-    {"type":"function","function":{"name":"read_pdf","description":"Read a PDF file. Extracts text and renders pages as images for visual understanding of charts, diagrams, layouts. Use for any PDF.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the PDF file"},"pages":{"type":"string","description":"Page range: 'all', '1', '1-3', '2,5,8'. Default: first 5 pages."}},"required":["path"]}}},
-    {"type":"function","function":{"name":"computer_use","description":"Control the Mac GUI. Every action automatically takes a screenshot and reads the screen content. Actions: scroll (SCROLL PAGE DOWN to see more content), click:x,y (click at coordinates 0-1000), type:text, key:name, hotkey:cmd+key, open:URL_or_AppName, wait:seconds. IMPORTANT: Use 'scroll' to see more content on a page. Do NOT call 'screenshot' repeatedly.","parameters":{"type":"object","properties":{"action":{"type":"string","description":"Action: 'scroll' (page down), 'scroll up', 'click:500,300', 'type:hello world', 'key:return', 'hotkey:cmd+a', 'open:https://x.com/search?q=AI', 'open:WhatsApp', 'wait:2'"}},"required":["action"]}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run any shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Find and replace text in a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web via DuckDuckGo. For photo/image queries, prefer direct image URLs and real-photo results over article pages, logos, or illustrations.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch a URL and return status + body. Extract article images via Jina Reader and og:image when possible.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_pdf",
+            "description": "Read a PDF file. Extracts text and renders pages as images for visual understanding of charts, diagrams, layouts. Use for any PDF.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the PDF file"},
+                    "pages": {
+                        "type": "string",
+                        "description": "Page range: 'all', '1', '1-3', '2,5,8'. Default: first 5 pages.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "computer_use",
+            "description": "Control the Mac GUI. Every action automatically takes a screenshot and reads the screen content. Actions: scroll (SCROLL PAGE DOWN to see more content), click:x,y (click at coordinates 0-1000), type:text, key:name, hotkey:cmd+key, open:URL_or_AppName, wait:seconds. IMPORTANT: Use 'scroll' to see more content on a page. Do NOT call 'screenshot' repeatedly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action: 'scroll' (page down), 'scroll up', 'click:500,300', 'type:hello world', 'key:return', 'hotkey:cmd+a', 'open:https://x.com/search?q=AI', 'open:WhatsApp', 'wait:2'",
+                    }
+                },
+                "required": ["action"],
+            },
+        },
+    },
 ]
 
 SNAPSHOT_DIR = os.path.join(CWD, ".localcoder-snapshots")
 
 _last_snapshot = {}
+
+
 def snapshot_file(path):
     """Save a backup before modifying an existing file. Dedupes within 30s."""
     full = os.path.join(CWD, path) if not os.path.isabs(path) else path
@@ -740,6 +1632,7 @@ def snapshot_file(path):
     snap_path = os.path.join(SNAPSHOT_DIR, f"{ts}__{safe_name}")
     try:
         import shutil
+
         shutil.copy2(full, snap_path)
         logging.getLogger("localcoder").info(f"Snapshot: {path} → {snap_path}")
         # Clean old snapshots — keep max 20 per file
@@ -749,6 +1642,7 @@ def snapshot_file(path):
         return snap_path
     except:
         return None
+
 
 def list_snapshots(path=None):
     """List all snapshots, optionally filtered by filename."""
@@ -770,6 +1664,7 @@ def list_snapshots(path=None):
         lines.append(f"  [{i}] {ts} — {fname} ({size} bytes)")
     return "Snapshots:\n" + "\n".join(lines)
 
+
 def restore_snapshot(index=0, path=None):
     """Restore a file from a snapshot."""
     if not os.path.isdir(SNAPSHOT_DIR):
@@ -788,20 +1683,30 @@ def restore_snapshot(index=0, path=None):
     snap_path = os.path.join(SNAPSHOT_DIR, snap)
     try:
         import shutil
+
         shutil.copy2(snap_path, full)
         return f"Restored {orig_path} from snapshot {parts[0]}"
     except Exception as e:
         return f"Restore failed: {e}"
 
+
 def exec_tool(name, args):
     if name == "bash":
         cmd = args.get("command", "")
         # If downloading an image with curl, add browser user-agent to avoid blocks
-        if "curl" in cmd and any(ext in cmd for ext in ('.png', '.jpg', '.jpeg', '.webp', '.gif')):
-            if '-A' not in cmd and '--user-agent' not in cmd and '-H' not in cmd:
-                cmd = cmd.replace("curl ", 'curl -L -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ', 1)
+        if "curl" in cmd and any(
+            ext in cmd for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")
+        ):
+            if "-A" not in cmd and "--user-agent" not in cmd and "-H" not in cmd:
+                cmd = cmd.replace(
+                    "curl ",
+                    'curl -L -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ',
+                    1,
+                )
         try:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=CWD, timeout=60)
+            r = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, cwd=CWD, timeout=60
+            )
             return (r.stdout + r.stderr).strip()[:4000] or "(no output)"
         except subprocess.TimeoutExpired:
             return "Command started (timeout normal for servers)."
@@ -813,9 +1718,11 @@ def exec_tool(name, args):
         os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         with open(full, "w") as f:
             f.write(content)
-        lines = content.count('\n') + 1
+        lines = content.count("\n") + 1
         # If writing an image/binary, note the path for display
-        if any(path.lower().endswith(e) for e in ('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+        if any(
+            path.lower().endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp", ".gif")
+        ):
             return f"IMAGE:{full}|Written: {path} ({len(content)} bytes)"
         return f"Written: {path} ({lines} lines, {len(content)} chars)"
     elif name == "read_file":
@@ -824,11 +1731,11 @@ def exec_tool(name, args):
         with open(full) as f:
             content = f.read()
         # Strip HTML for .html files to save context
-        if path.endswith('.html') and '<html' in content[:200].lower():
-            text = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL)
-            text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'\s+', ' ', text).strip()
+        if path.endswith(".html") and "<html" in content[:200].lower():
+            text = re.sub(r"<script[^>]*>.*?</script>", "", content, flags=re.DOTALL)
+            text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
             return text[:3000]
         return content[:5000]
     elif name == "edit_file":
@@ -844,8 +1751,8 @@ def exec_tool(name, args):
         with open(full, "w") as f:
             f.write(new_content)
         # Show diff summary
-        old_lines = content.count('\n')
-        new_lines = new_content.count('\n')
+        old_lines = content.count("\n")
+        new_lines = new_content.count("\n")
         diff = new_lines - old_lines
         diff_str = f" ({'+' if diff > 0 else ''}{diff} lines)" if diff != 0 else ""
         return f"Edited: {path}{diff_str}"
@@ -853,19 +1760,36 @@ def exec_tool(name, args):
         url = args.get("url", "")
         try:
             # Auto-detect image URLs — download and display directly
-            if any(url.lower().endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+            if any(
+                url.lower().endswith(ext)
+                for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")
+            ):
                 img_name = os.path.basename(url.split("?")[0])[:50] or "image.jpg"
                 img_path = os.path.join(CWD, img_name)
                 try:
                     dl = subprocess.run(
-                        ["curl", "-fsSL", "-A", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", "-o", img_path, url],
-                        capture_output=True, timeout=15
+                        [
+                            "curl",
+                            "-fsSL",
+                            "-A",
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                            "-o",
+                            img_path,
+                            url,
+                        ],
+                        capture_output=True,
+                        timeout=15,
                     )
                     if os.path.isfile(img_path) and os.path.getsize(img_path) > 500:
                         # Validate magic bytes
-                        with open(img_path, 'rb') as _f:
+                        with open(img_path, "rb") as _f:
                             hdr = _f.read(8)
-                        if hdr[:2] == b'\xff\xd8' or hdr[:4] == b'\x89PNG' or hdr[:4] == b'GIF8' or hdr[:4] == b'RIFF':
+                        if (
+                            hdr[:2] == b"\xff\xd8"
+                            or hdr[:4] == b"\x89PNG"
+                            or hdr[:4] == b"GIF8"
+                            or hdr[:4] == b"RIFF"
+                        ):
                             show_image_inline(img_path)
                             sz = os.path.getsize(img_path) // 1024
                             return f"Image downloaded and displayed: {img_name} ({sz} KB)\nSaved to: {img_path}"
@@ -877,20 +1801,27 @@ def exec_tool(name, args):
 
             # Use Jina Reader — reads full page, renders JS, returns markdown
             jina_url = f"https://r.jina.ai/{url}"
-            req = urllib.request.Request(jina_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"})
+            req = urllib.request.Request(
+                jina_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"}
+            )
             try:
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     full = resp.read().decode("utf-8", errors="replace")
                     if len(full) > 100:
-                        # Extract images from full content
-                        imgs = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', full)
-                        imgs += re.findall(r'(https?://[^\s\)\"]+\.(?:png|jpg|jpeg|webp|gif))', full)
-                        good = list(dict.fromkeys(i for i in imgs if 'nav__' not in i and 'icon' not in i.lower()))
-                        parts = [f"Status: 200 (via Jina Reader) · {len(full)} chars total"]
+                        good = _extract_image_candidates_from_text(full, source_url=url)
+                        parts = [
+                            f"Status: 200 (via Jina Reader) · {len(full)} chars total"
+                        ]
                         # Put images FIRST so they don't get truncated
                         if good:
-                            parts.append(f"\n--- {len(good)} images found on this page ---")
-                            parts.extend(good[:8])
+                            try:
+                                show_image_url(good[0]["url"], max_width=50, max_height=12)
+                            except Exception:
+                                pass
+                            parts.append(
+                                f"\n--- {len(good)} images found on this page ---"
+                            )
+                            parts.extend(candidate["url"] for candidate in good[:8])
                             parts.append("--- end images ---\n")
                         parts.append(full[:1500])
                         return "\n".join(parts)
@@ -900,43 +1831,104 @@ def exec_tool(name, args):
             # Direct fallback
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                ct = resp.headers.get('Content-Type', '')
+                ct = resp.headers.get("Content-Type", "")
                 raw = resp.read(10000).decode("utf-8", errors="replace")
-                if 'image' in ct:
+                if "image" in ct:
                     return f"Status: {resp.status} · This is an image file ({ct}, {len(raw)} bytes). Use bash with 'curl -o filename.png {url}' to download it."
-                if 'html' in ct:
-                    og = re.findall(r'(?:property|name)="(?:og|twitter):image"[^>]*content="([^"]+)"', raw)
-                    imgs = re.findall(r'https?://[^\s"\'<>]+\.(?:png|jpg|jpeg|webp|gif)', raw)
-                    all_imgs = list(dict.fromkeys(og + imgs))
-                    text = re.sub(r'<script[^>]*>.*?</script>', '', raw, flags=re.DOTALL)
-                    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
-                    text = re.sub(r'<[^>]+>', ' ', text)
-                    text = re.sub(r'\s+', ' ', text).strip()
-                    img_str = "\n\nImages:\n" + "\n".join(all_imgs[:5]) if all_imgs else ""
+                if "html" in ct:
+                    og = re.findall(
+                        r'(?:property|name)="(?:og|twitter):image"[^>]*content="([^"]+)"',
+                        raw,
+                    )
+                    imgs = re.findall(
+                        r'https?://[^\s"\'<>]+\.(?:png|jpg|jpeg|webp|gif)', raw
+                    )
+                    all_imgs = _sort_image_candidates(
+                        [{"url": image_url, "title": "", "source": url} for image_url in (og + imgs)]
+                    )
+                    text = re.sub(
+                        r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL
+                    )
+                    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
+                    text = re.sub(r"<[^>]+>", " ", text)
+                    text = re.sub(r"\s+", " ", text).strip()
+                    img_str = (
+                        "\n\nImages:\n"
+                        + "\n".join(candidate["url"] for candidate in all_imgs[:5])
+                        if all_imgs
+                        else ""
+                    )
+                    if all_imgs:
+                        try:
+                            show_image_url(all_imgs[0]["url"], max_width=50, max_height=12)
+                        except Exception:
+                            pass
                     return f"Status: {resp.status}\n{text[:1500]}{img_str}"
                 return f"Status: {resp.status}\nType: {ct}\n{raw[:1500]}"
         except Exception as e:
             return f"Error: {e}"
     elif name == "web_search":
         query = args.get("query", "")
-        is_image_query = any(w in query.lower() for w in ['image', 'logo', 'photo', 'screenshot', 'picture', 'png', 'jpg', 'icon', 'wallpaper', 'unsplash'])
+        is_image_query = any(
+            w in query.lower()
+            for w in [
+                "image",
+                "images",
+                "logo",
+                "photo",
+                "photos",
+                "screenshot",
+                "picture",
+                "pictures",
+                "png",
+                "jpg",
+                "icon",
+                "wallpaper",
+                "unsplash",
+                "official photo",
+                "real photo",
+                "صورة",
+                "صور",
+            ]
+        )
 
         # Image search via ddgs package
         if is_image_query:
             try:
                 from ddgs import DDGS
-                results = DDGS().images(query.replace('image', '').replace('unsplash', '').strip(), max_results=5)
+
+                results = list(
+                    DDGS().images(
+                        _rewrite_photo_search_query(query),
+                        max_results=12,
+                    )
+                )
+                candidates = _sort_image_candidates(
+                    [
+                        {
+                            "url": r.get("image", ""),
+                            "title": r.get("title", ""),
+                            "source": r.get("url", ""),
+                            "thumbnail": r.get("thumbnail", ""),
+                        }
+                        for r in results
+                    ]
+                )
                 imgs = []
-                for r in results:
-                    imgs.append(f"- {r.get('title','')[:60]}\n  URL: {r.get('image','')}\n  Thumbnail: {r.get('thumbnail','')}\n  Source: {r.get('url','')}")
+                for candidate in candidates[:6]:
+                    imgs.append(
+                        f"- {(candidate.get('title') or '')[:60]}\n  URL: {candidate.get('url', '')}\n  Source: {candidate.get('source', '')}"
+                    )
                 if imgs:
-                    first_url = results[0].get('image', '') if results else ''
+                    first_url = candidates[0].get("url", "") if candidates else ""
                     if first_url:
                         try:
                             show_image_url(first_url, max_width=50, max_height=12)
                         except Exception:
                             pass
-                    return f"Image search results for '{query}':\n\n" + "\n\n".join(imgs)
+                    return f"Image search results for '{query}':\n\n" + "\n\n".join(
+                        imgs
+                    )
             except ImportError:
                 pass  # ddgs not installed, try unsplash fallback
             except Exception:
@@ -944,23 +1936,36 @@ def exec_tool(name, args):
 
             # Unsplash fallback (no API key, direct source URLs)
             try:
-                kw = urllib.parse.quote(query.replace('image', '').replace('unsplash', '').strip())
+                kw = urllib.parse.quote(
+                    query.replace("image", "").replace("unsplash", "").strip()
+                )
                 imgs = []
                 for i in range(5):
                     url = f"https://source.unsplash.com/random/800x600/?{kw}&sig={i}"
-                    imgs.append(f"- Unsplash image {i+1}\n  URL: {url}")
-                return f"Unsplash images for '{query}':\n\n" + "\n\n".join(imgs) + "\n\nUse these URLs directly in <img src='URL'> tags."
+                    imgs.append(f"- Unsplash image {i + 1}\n  URL: {url}")
+                return (
+                    f"Unsplash images for '{query}':\n\n"
+                    + "\n\n".join(imgs)
+                    + "\n\nUse these URLs directly in <img src='URL'> tags."
+                )
             except Exception:
                 pass
 
         # Regular web search via ddgs package
         try:
             from ddgs import DDGS
+
             results = DDGS().text(query, max_results=5)
             formatted = []
             for r in results:
-                formatted.append(f"[{r.get('title','')}]({r.get('href','')})\n{r.get('body','')[:150]}")
-            return f"Search results for '{query}':\n\n" + "\n\n".join(formatted) if formatted else f"No results for '{query}'"
+                formatted.append(
+                    f"[{r.get('title', '')}]({r.get('href', '')})\n{r.get('body', '')[:150]}"
+                )
+            return (
+                f"Search results for '{query}':\n\n" + "\n\n".join(formatted)
+                if formatted
+                else f"No results for '{query}'"
+            )
         except ImportError:
             return f"Search requires 'ddgs' package. Install: pip install ddgs"
         except Exception as e:
@@ -973,42 +1978,65 @@ def exec_tool(name, args):
             # Execute action FIRST (before screenshot)
             action_result = ""
             # Track last opened app for screenshot focus
-            if not hasattr(exec_tool, '_last_app'):
+            if not hasattr(exec_tool, "_last_app"):
                 exec_tool._last_app = "Google Chrome"
 
             if action == "screenshot":
                 # Auto-convert repeated screenshots to scroll
-                if not hasattr(exec_tool, '_screenshot_count'):
+                if not hasattr(exec_tool, "_screenshot_count"):
                     exec_tool._screenshot_count = 0
                 exec_tool._screenshot_count += 1
                 if exec_tool._screenshot_count > 1:
                     action = "scroll"  # force scroll instead of redundant screenshot
-                    console.print(f"  [dim yellow]Auto-scrolling instead of repeated screenshot[/]")
+                    console.print(
+                        f"  [dim yellow]Auto-scrolling instead of repeated screenshot[/]"
+                    )
 
             if action == "screenshot" or action.startswith("scroll"):
                 # Bring last app to front
-                subprocess.run(["osascript", "-e", f'tell application "{exec_tool._last_app}" to activate'],
-                    capture_output=True, timeout=3)
+                subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        f'tell application "{exec_tool._last_app}" to activate',
+                    ],
+                    capture_output=True,
+                    timeout=3,
+                )
                 time.sleep(0.3)
                 if action.startswith("scroll"):
                     direction = "down"
                     if "up" in action:
                         direction = "up"
                     # Click content area to ensure page has focus
-                    subprocess.run(["cliclick", "c:400,500"], capture_output=True, timeout=3)
+                    subprocess.run(
+                        ["cliclick", "c:400,500"], capture_output=True, timeout=3
+                    )
                     time.sleep(0.2)
                     # Use space bar for scroll down (works in all browsers)
                     # Use shift+space for scroll up
                     # 3 space presses for a full page scroll
                     for _ in range(3):
                         if direction == "down":
-                            subprocess.run(["osascript", "-e",
-                                'tell application "System Events" to keystroke space'],
-                                capture_output=True, timeout=3)
+                            subprocess.run(
+                                [
+                                    "osascript",
+                                    "-e",
+                                    'tell application "System Events" to keystroke space',
+                                ],
+                                capture_output=True,
+                                timeout=3,
+                            )
                         else:
-                            subprocess.run(["osascript", "-e",
-                                'tell application "System Events" to keystroke space using shift down'],
-                                capture_output=True, timeout=3)
+                            subprocess.run(
+                                [
+                                    "osascript",
+                                    "-e",
+                                    'tell application "System Events" to keystroke space using shift down',
+                                ],
+                                capture_output=True,
+                                timeout=3,
+                            )
                         time.sleep(0.3)
                     time.sleep(0.5)
                     action_result = f"Scrolled {direction}"
@@ -1017,13 +2045,23 @@ def exec_tool(name, args):
             elif action.startswith("click:"):
                 exec_tool._screenshot_count = 0  # reset on non-screenshot action
                 coords = action.split(":", 1)[1]
-                x, y = int(coords.split(",")[0].strip()), int(coords.split(",")[1].strip())
+                x, y = (
+                    int(coords.split(",")[0].strip()),
+                    int(coords.split(",")[1].strip()),
+                )
                 # Convert from 1000x1000 normalized to actual screen coordinates
                 # Get screen size
                 try:
-                    _scr = subprocess.run(["osascript", "-e",
-                        'tell application "Finder" to get bounds of window of desktop'],
-                        capture_output=True, text=True, timeout=3)
+                    _scr = subprocess.run(
+                        [
+                            "osascript",
+                            "-e",
+                            'tell application "Finder" to get bounds of window of desktop',
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                    )
                     _parts = _scr.stdout.strip().split(", ")
                     scr_w, scr_h = int(_parts[2]), int(_parts[3])
                 except:
@@ -1031,37 +2069,81 @@ def exec_tool(name, args):
                 sx = int(x * scr_w / 1000)
                 sy = int(y * scr_h / 1000)
                 # Bring last app to front before clicking
-                subprocess.run(["osascript", "-e", f'tell application "{exec_tool._last_app}" to activate'],
-                    capture_output=True, timeout=3)
+                subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        f'tell application "{exec_tool._last_app}" to activate',
+                    ],
+                    capture_output=True,
+                    timeout=3,
+                )
                 time.sleep(0.2)
-                subprocess.run(["cliclick", f"c:{sx},{sy}"], capture_output=True, timeout=3)
+                subprocess.run(
+                    ["cliclick", f"c:{sx},{sy}"], capture_output=True, timeout=3
+                )
                 action_result = f"Clicked at screen ({sx},{sy}) from bbox ({x},{y})"
                 time.sleep(0.3)
             elif action.startswith("type:"):
                 text = action.split(":", 1)[1]
-                subprocess.run(["osascript", "-e",
-                    f'tell application "System Events" to keystroke "{text}"'],
-                    capture_output=True, timeout=3)
+                subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        f'tell application "System Events" to keystroke "{text}"',
+                    ],
+                    capture_output=True,
+                    timeout=3,
+                )
                 action_result = f"Typed: {text}"
                 time.sleep(0.3)
             elif action.startswith("key:"):
                 key = action.split(":", 1)[1].strip()
                 # Normalize key names: underscore→hyphen, common aliases
-                key = key.replace("_", "-").replace("escape", "esc").replace("enter", "return")
+                key = (
+                    key.replace("_", "-")
+                    .replace("escape", "esc")
+                    .replace("enter", "return")
+                )
                 # Map key names to AppleScript key codes
-                _key_map = {"return": 36, "esc": 53, "tab": 48, "delete": 51, "space": 49,
-                            "arrow-up": 126, "arrow-down": 125, "arrow-left": 123, "arrow-right": 124,
-                            "page-down": 121, "page-up": 116, "home": 115, "end": 119, "enter": 36}
+                _key_map = {
+                    "return": 36,
+                    "esc": 53,
+                    "tab": 48,
+                    "delete": 51,
+                    "space": 49,
+                    "arrow-up": 126,
+                    "arrow-down": 125,
+                    "arrow-left": 123,
+                    "arrow-right": 124,
+                    "page-down": 121,
+                    "page-up": 116,
+                    "home": 115,
+                    "end": 119,
+                    "enter": 36,
+                }
                 kc = _key_map.get(key)
                 if kc:
-                    subprocess.run(["osascript", "-e",
-                        f'tell application "System Events" to key code {kc}'],
-                        capture_output=True, timeout=3)
+                    subprocess.run(
+                        [
+                            "osascript",
+                            "-e",
+                            f'tell application "System Events" to key code {kc}',
+                        ],
+                        capture_output=True,
+                        timeout=3,
+                    )
                 else:
                     # Single character key
-                    subprocess.run(["osascript", "-e",
-                        f'tell application "System Events" to keystroke "{key}"'],
-                        capture_output=True, timeout=3)
+                    subprocess.run(
+                        [
+                            "osascript",
+                            "-e",
+                            f'tell application "System Events" to keystroke "{key}"',
+                        ],
+                        capture_output=True,
+                        timeout=3,
+                    )
                 action_result = f"Pressed key: {key}"
                 time.sleep(0.3)
             elif action.startswith("hotkey:"):
@@ -1071,9 +2153,15 @@ def exec_tool(name, args):
                 key_char = parts[-1]
                 modifiers = [p for p in parts[:-1]]
                 mod_str = " using {" + ", ".join(f"{m} down" for m in modifiers) + "}"
-                subprocess.run(["osascript", "-e",
-                    f'tell application "System Events" to keystroke "{key_char}"{mod_str}'],
-                    capture_output=True, timeout=5)
+                subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        f'tell application "System Events" to keystroke "{key_char}"{mod_str}',
+                    ],
+                    capture_output=True,
+                    timeout=5,
+                )
                 action_result = f"Hotkey: {keys}"
                 time.sleep(0.3)
             elif action.startswith("open:"):
@@ -1081,18 +2169,29 @@ def exec_tool(name, args):
                 if target.startswith("http") or "." in target and "/" in target:
                     # URL — open in Chrome specifically
                     url = target if target.startswith("http") else f"https://{target}"
-                    subprocess.run(["open", "-a", "Google Chrome", url], capture_output=True, timeout=5)
+                    subprocess.run(
+                        ["open", "-a", "Google Chrome", url],
+                        capture_output=True,
+                        timeout=5,
+                    )
                     action_result = f"Opened {url} in Chrome"
                 else:
                     # App name
-                    subprocess.run(["open", "-a", target], capture_output=True, timeout=5)
+                    subprocess.run(
+                        ["open", "-a", target], capture_output=True, timeout=5
+                    )
                     action_result = f"Opened {target}"
                 time.sleep(2)
                 # Track and bring to front
-                app_name = "Google Chrome" if ("http" in target or "." in target) else target
+                app_name = (
+                    "Google Chrome" if ("http" in target or "." in target) else target
+                )
                 exec_tool._last_app = app_name
-                subprocess.run(["osascript", "-e", f'tell application "{app_name}" to activate'],
-                    capture_output=True, timeout=3)
+                subprocess.run(
+                    ["osascript", "-e", f'tell application "{app_name}" to activate'],
+                    capture_output=True,
+                    timeout=3,
+                )
                 time.sleep(0.5)
             elif action.startswith("wait:"):
                 secs = float(action.split(":", 1)[1])
@@ -1103,14 +2202,26 @@ def exec_tool(name, args):
 
             # ADK pattern: EVERY action captures current_state (screenshot)
             # Bring target app to front before screenshotting
-            subprocess.run(["osascript", "-e", f'tell application "{exec_tool._last_app}" to activate'],
-                capture_output=True, timeout=3)
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'tell application "{exec_tool._last_app}" to activate',
+                ],
+                capture_output=True,
+                timeout=3,
+            )
             time.sleep(0.5)
 
             ss_path = "/tmp/localcoder-screen.png"
-            subprocess.run(["screencapture", "-x", ss_path], capture_output=True, timeout=5)
-            subprocess.run(["sips", "-Z", "1000", ss_path, "--out", ss_path],
-                capture_output=True, timeout=5)
+            subprocess.run(
+                ["screencapture", "-x", ss_path], capture_output=True, timeout=5
+            )
+            subprocess.run(
+                ["sips", "-Z", "1000", ss_path, "--out", ss_path],
+                capture_output=True,
+                timeout=5,
+            )
 
             # Display inline
             show_image_inline(ss_path)
@@ -1119,33 +2230,70 @@ def exec_tool(name, args):
             screen_desc = ""
             try:
                 img_data = _b64.b64encode(open(ss_path, "rb").read()).decode()
-                vision_payload = json.dumps({
-                    "model": MODEL,
-                    "messages": [{"role": "user", "content": [
-                        {"type": "text", "text": "Extract the MAIN CONTENT from this screenshot. Ignore browser chrome/menus. Focus on: posts, tweets, articles, chat messages, search results, form data. Report as structured data."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_data}"}}
-                    ]}],
-                    "max_tokens": 1500
-                }).encode()
-                vision_req = urllib.request.Request(f"{API_BASE}/chat/completions",
-                    data=vision_payload, headers={"Content-Type": "application/json"})
+                vision_payload = json.dumps(
+                    {
+                        "model": MODEL,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Extract the MAIN CONTENT from this screenshot. Ignore browser chrome/menus. Focus on: posts, tweets, articles, chat messages, search results, form data. Report as structured data.",
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/png;base64,{img_data}"
+                                        },
+                                    },
+                                ],
+                            }
+                        ],
+                        "max_tokens": 1500,
+                    }
+                ).encode()
+                vision_req = urllib.request.Request(
+                    f"{API_BASE}/chat/completions",
+                    data=vision_payload,
+                    headers={"Content-Type": "application/json"},
+                )
                 vision_resp = urllib.request.urlopen(vision_req, timeout=90)
                 vision_r = json.loads(vision_resp.read())
                 vision_msg = vision_r["choices"][0]["message"]
-                screen_desc = vision_msg.get("content", "") or vision_msg.get("reasoning_content", "")
+                screen_desc = vision_msg.get("content", "") or vision_msg.get(
+                    "reasoning_content", ""
+                )
                 # Strip reasoning preamble — find where actual data starts
-                for marker in ["```", "{", "**", "1.", "- ", "•", "Post", "Tweet", "@", "Author"]:
+                for marker in [
+                    "```",
+                    "{",
+                    "**",
+                    "1.",
+                    "- ",
+                    "•",
+                    "Post",
+                    "Tweet",
+                    "@",
+                    "Author",
+                ]:
                     idx = screen_desc.find(marker)
                     if idx > 0 and idx < 300:
                         screen_desc = screen_desc[idx:]
                         break
                 # Remove common preamble sentences
-                for phrase in ["I need to extract", "The user wants", "Let me analyze",
-                               "The screenshot shows", "I will now", "Ignore browser"]:
+                for phrase in [
+                    "I need to extract",
+                    "The user wants",
+                    "Let me analyze",
+                    "The screenshot shows",
+                    "I will now",
+                    "Ignore browser",
+                ]:
                     if screen_desc.lstrip().startswith(phrase):
                         nl = screen_desc.find("\n\n")
                         if nl > 0:
-                            screen_desc = screen_desc[nl+2:]
+                            screen_desc = screen_desc[nl + 2 :]
                 screen_desc = screen_desc[:2000]
             except:
                 screen_desc = "(could not read screen)"
@@ -1168,7 +2316,9 @@ def exec_tool(name, args):
 
         try:
             # Get page count
-            info = subprocess.run(["pdfinfo", full], capture_output=True, text=True, timeout=5)
+            info = subprocess.run(
+                ["pdfinfo", full], capture_output=True, text=True, timeout=5
+            )
             total_pages = 0
             for line in info.stdout.split("\n"):
                 if line.startswith("Pages:"):
@@ -1188,8 +2338,18 @@ def exec_tool(name, args):
 
             # Extract text
             text_result = subprocess.run(
-                ["pdftotext", "-f", str(page_list[0]), "-l", str(page_list[-1]), full, "-"],
-                capture_output=True, text=True, timeout=15
+                [
+                    "pdftotext",
+                    "-f",
+                    str(page_list[0]),
+                    "-l",
+                    str(page_list[-1]),
+                    full,
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             text_content = text_result.stdout[:3000]
 
@@ -1198,8 +2358,20 @@ def exec_tool(name, args):
             for pg in page_list[:5]:  # max 5 page images
                 img_prefix = os.path.join(tmp_dir, f"page_{pg}")
                 subprocess.run(
-                    ["pdftoppm", "-f", str(pg), "-l", str(pg), "-r", "150", "-png", full, img_prefix],
-                    capture_output=True, timeout=10
+                    [
+                        "pdftoppm",
+                        "-f",
+                        str(pg),
+                        "-l",
+                        str(pg),
+                        "-r",
+                        "150",
+                        "-png",
+                        full,
+                        img_prefix,
+                    ],
+                    capture_output=True,
+                    timeout=10,
                 )
                 # pdftoppm outputs page_N-01.png
                 for f in os.listdir(tmp_dir):
@@ -1217,14 +2389,19 @@ def exec_tool(name, args):
                 f"\n--- TEXT CONTENT ---\n{text_content}",
             ]
             if page_images:
-                result_parts.append(f"\n--- {len(page_images)} page images rendered (displayed inline in terminal) ---")
+                result_parts.append(
+                    f"\n--- {len(page_images)} page images rendered (displayed inline in terminal) ---"
+                )
                 # Include base64 so vision models can see the pages
                 import base64 as _b64
+
                 for img in page_images:
                     try:
                         img_b64 = _b64.b64encode(open(img, "rb").read()).decode()
                         sz_kb = os.path.getsize(img) // 1024
-                        result_parts.append(f"[Image: {os.path.basename(img)} ({sz_kb}KB) — base64 attached for vision]")
+                        result_parts.append(
+                            f"[Image: {os.path.basename(img)} ({sz_kb}KB) — base64 attached for vision]"
+                        )
                     except:
                         result_parts.append(f"Page image: {img}")
 
@@ -1236,6 +2413,7 @@ def exec_tool(name, args):
             # Cleanup old tmp files (keep last 5 mins)
             try:
                 import time as _time
+
                 for f in os.listdir(tmp_dir):
                     fp = os.path.join(tmp_dir, f)
                     if _time.time() - os.path.getmtime(fp) > 300:
@@ -1245,8 +2423,10 @@ def exec_tool(name, args):
 
     return f"Unknown tool: {name}"
 
+
 def estimate_tokens(text):
     return len(str(text)) // 4
+
 
 def summarize_tool_result(content, fname):
     """Smart truncation based on tool type"""
@@ -1254,19 +2434,24 @@ def summarize_tool_result(content, fname):
         return content
     # Bash: keep first/last lines (errors are usually at the end)
     if fname == "bash":
-        lines = content.split('\n')
+        lines = content.split("\n")
         if len(lines) > 8:
-            return '\n'.join(lines[:4]) + f'\n... ({len(lines)-8} lines omitted) ...\n' + '\n'.join(lines[-4:])
+            return (
+                "\n".join(lines[:4])
+                + f"\n... ({len(lines) - 8} lines omitted) ...\n"
+                + "\n".join(lines[-4:])
+            )
         return content[:600]
     # Search: keep first 3 results only
     if fname == "web_search":
-        results = content.split('\n\n')
-        return '\n\n'.join(results[:4])[:600]
+        results = content.split("\n\n")
+        return "\n\n".join(results[:4])[:600]
     # File reads: keep first chunk
     if fname == "read_file":
         return content[:500] + "...(truncated)" if len(content) > 500 else content
     # Everything else
     return content[:400] + "...(truncated)" if len(content) > 400 else content
+
 
 def compress_messages(messages, max_tokens=12000):
     """Claude-style context management:
@@ -1285,12 +2470,22 @@ def compress_messages(messages, max_tokens=12000):
         if isinstance(msg, dict) and msg.get("role") == "tool":
             # Find which tool generated this
             fname = "unknown"
-            for j in range(i-1, -1, -1):
+            for j in range(i - 1, -1, -1):
                 prev = rest[j]
-                if hasattr(prev, 'tool_calls') or (isinstance(prev, dict) and prev.get("tool_calls")):
-                    tc = prev.get("tool_calls", []) if isinstance(prev, dict) else prev.tool_calls
+                if hasattr(prev, "tool_calls") or (
+                    isinstance(prev, dict) and prev.get("tool_calls")
+                ):
+                    tc = (
+                        prev.get("tool_calls", [])
+                        if isinstance(prev, dict)
+                        else prev.tool_calls
+                    )
                     if tc:
-                        fname = tc[0].get("function", {}).get("name", "") if isinstance(tc[0], dict) else tc[0].function.name
+                        fname = (
+                            tc[0].get("function", {}).get("name", "")
+                            if isinstance(tc[0], dict)
+                            else tc[0].function.name
+                        )
                     break
             msg["content"] = summarize_tool_result(msg.get("content", ""), fname)
 
@@ -1314,10 +2509,15 @@ def compress_messages(messages, max_tokens=12000):
                 elif role == "assistant" and msg.get("content"):
                     summary_parts.append(f"Agent responded: {msg['content'][:80]}")
                 elif role == "tool":
-                    summary_parts.append(f"Tool returned: {msg.get('content', '')[:40]}")
+                    summary_parts.append(
+                        f"Tool returned: {msg.get('content', '')[:40]}"
+                    )
 
         if summary_parts:
-            summary = {"role": "user", "content": f"[Earlier in this conversation: {'; '.join(summary_parts[:5])}]"}
+            summary = {
+                "role": "user",
+                "content": f"[Earlier in this conversation: {'; '.join(summary_parts[:5])}]",
+            }
             rest = [summary] + keep
         else:
             rest = keep
@@ -1329,6 +2529,7 @@ def compress_messages(messages, max_tokens=12000):
     # Pass 3: Emergency — keep only system + last 3
     return [system] + rest[-3:]
 
+
 def chat_api(messages, spinner=None):
     """Call the LLM API with streaming.
 
@@ -1339,19 +2540,28 @@ def chat_api(messages, spinner=None):
     messages = compress_messages(messages)
     tokens_est = estimate_tokens(json.dumps(messages))
     if before != len(messages):
-        logging.getLogger("localcoder").info(f"Compressed {before} → {len(messages)} msgs (~{tokens_est} tokens)")
+        logging.getLogger("localcoder").info(
+            f"Compressed {before} → {len(messages)} msgs (~{tokens_est} tokens)"
+        )
     else:
-        logging.getLogger("localcoder").debug(f"API call: {len(messages)} msgs, ~{tokens_est} tokens")
+        logging.getLogger("localcoder").debug(
+            f"API call: {len(messages)} msgs, ~{tokens_est} tokens"
+        )
 
     body = {
-        "model": MODEL, "messages": messages, "tools": TOOLS,
-        "temperature": 1.0, "top_p": 0.95, "stream": True,
+        "model": MODEL,
+        "messages": messages,
+        "tools": TOOLS,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "stream": True,
     }
     if REASONING_EFFORT != "medium":
         body["reasoning_effort"] = REASONING_EFFORT
     payload = json.dumps(body).encode()
     req = urllib.request.Request(
-        f"{API_BASE}/chat/completions", data=payload,
+        f"{API_BASE}/chat/completions",
+        data=payload,
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
 
@@ -1363,8 +2573,8 @@ def chat_api(messages, spinner=None):
     timings = {}
     model_name = MODEL
     streaming_started = False
-    reasoning_started = False
     token_count = 0
+    stream_started_at = time.time()
 
     with urllib.request.urlopen(req, timeout=300) as resp:
         for raw_line in resp:
@@ -1381,7 +2591,9 @@ def chat_api(messages, spinner=None):
                 continue
 
             delta = chunk.get("choices", [{}])[0].get("delta", {})
-            finish_reason = chunk.get("choices", [{}])[0].get("finish_reason") or finish_reason
+            finish_reason = (
+                chunk.get("choices", [{}])[0].get("finish_reason") or finish_reason
+            )
             model_name = chunk.get("model", model_name)
 
             # Usage info (llama.cpp sends it in the last chunk)
@@ -1405,31 +2617,29 @@ def chat_api(messages, spinner=None):
                     sys.stdout.write("\r\033[K")
                     sys.stdout.flush()
 
-            # Stream reasoning content (dimmed, hidden when effort=none)
+            # Keep reasoning buffered so we can render it as a clean card
+            # instead of the old narrow ANSI box.
             reasoning_chunk = delta.get("reasoning_content", "")
             if reasoning_chunk:
                 reasoning_parts.append(reasoning_chunk)
                 token_count += 1
-                if REASONING_EFFORT != "none":
-                    if not reasoning_started:
-                        reasoning_started = True
-                        _kill_spinner()
-                        sys.stdout.write("  \033[2;35m┌─ thinking ─────────────────────\033[0m\n  \033[2;35m│ \033[0m\033[2m")
-                        sys.stdout.flush()
-                    sys.stdout.write(f"\033[2m{reasoning_chunk}\033[0m")
-                    sys.stdout.flush()
 
             # Stream text content live (normal style)
             text_chunk = delta.get("content", "")
             if text_chunk:
                 if not streaming_started:
                     streaming_started = True
-                    if reasoning_started:
-                        # End reasoning block, start content
-                        sys.stdout.write("\033[0m\n  \033[2;35m└────────────────────────────────\033[0m\n\n  ")
-                    else:
-                        _kill_spinner()
-                        sys.stdout.write("  ")
+                    _kill_spinner()
+                    reasoning_text = "".join(reasoning_parts).strip()
+                    if reasoning_text and REASONING_EFFORT != "none":
+                        console.print(
+                            _render_reasoning_panel(
+                                reasoning_text,
+                                stream_started_at,
+                            )
+                        )
+                        console.print()
+                    sys.stdout.write("  ")
                     sys.stdout.flush()
                 sys.stdout.write(text_chunk)
                 sys.stdout.flush()
@@ -1448,7 +2658,21 @@ def chat_api(messages, spinner=None):
                 if tc_delta.get("function", {}).get("name"):
                     tool_calls[idx]["function"]["name"] = tc_delta["function"]["name"]
                 if tc_delta.get("function", {}).get("arguments"):
-                    tool_calls[idx]["function"]["arguments"] += tc_delta["function"]["arguments"]
+                    tool_calls[idx]["function"]["arguments"] += tc_delta["function"][
+                        "arguments"
+                    ]
+
+    reasoning = "".join(reasoning_parts)
+    if not streaming_started:
+        _kill_spinner()
+        if reasoning.strip() and REASONING_EFFORT != "none":
+            console.print(
+                _render_reasoning_panel(
+                    reasoning,
+                    stream_started_at,
+                )
+            )
+            console.print()
 
     if streaming_started:
         sys.stdout.write("\n")
@@ -1456,7 +2680,6 @@ def chat_api(messages, spinner=None):
 
     # Build compatible response dict
     content = "".join(content_parts)
-    reasoning = "".join(reasoning_parts)
     msg = {"role": "assistant", "content": content}
     if reasoning:
         msg["reasoning_content"] = reasoning
@@ -1464,11 +2687,15 @@ def chat_api(messages, spinner=None):
         msg["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls.keys())]
 
     if not usage:
-        usage = {"completion_tokens": token_count, "prompt_tokens": 0, "total_tokens": token_count}
+        usage = {
+            "completion_tokens": token_count,
+            "prompt_tokens": 0,
+            "total_tokens": token_count,
+        }
 
     tps = timings.get("predicted_per_second", 0)
     logging.getLogger("localcoder").info(
-        f"Response: {usage.get('completion_tokens',0)} tokens, {tps:.0f} tok/s, prompt={usage.get('prompt_tokens',0)}"
+        f"Response: {usage.get('completion_tokens', 0)} tokens, {tps:.0f} tok/s, prompt={usage.get('prompt_tokens', 0)}"
     )
 
     return {
@@ -1478,9 +2705,11 @@ def chat_api(messages, spinner=None):
         "model": model_name,
     }
 
+
 # ── Rich display ──
 def show_tool_call(fname, args):
     show_tool_animation(console, fname, args)
+
 
 def show_image_inline(path):
     """Display image inline in terminal — auto-detects best method"""
@@ -1490,15 +2719,82 @@ def show_image_inline(path):
     if os.path.exists(timg):
         try:
             # Use iTerm2 protocol for best quality, fall back to half-blocks
-            proto = "i" if os.environ.get("TERM_PROGRAM", "").startswith("iTerm") else "h"
-            subprocess.run([timg, "-g", "60x20", "-p", proto, path], timeout=5, cwd=CWD)
+            proto = (
+                "i" if os.environ.get("TERM_PROGRAM", "").startswith("iTerm") else "h"
+            )
+            subprocess.run(
+                [timg, "-g", "60x20", "-C", "-p", proto, path], timeout=5, cwd=CWD
+            )
             console.print(f"  [dim green]📸 {os.path.basename(path)}[/]")
             return
         except:
             pass
     # Fallback: open in Preview
-    subprocess.Popen(["open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(
+        ["open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
     console.print(f"  [dim green]📸 Opened {os.path.basename(path)} in Preview[/]")
+
+
+def _render_user_turn(text, note=None):
+    body = Text(_display_text(text), style="bold white")
+    if note:
+        body = Group(
+            body,
+            Text(_display_text(note), style="dim green"),
+        )
+    title = "you"
+    if UI_LANG == "ar":
+        title = _display_text("أنت")
+    elif UI_LANG == "fr":
+        title = "vous"
+    return Panel(
+        body,
+        title=f"[bold #94a3b8]{title}[/]",
+        title_align="left",
+        border_style="#4b5563",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def _render_reasoning_panel(reasoning_text, start_time, tokens=0, tps=0.0):
+    cleaned = _localize_reasoning_text((reasoning_text or "").replace("\r", "").strip())
+    if len(cleaned) > 1200:
+        cleaned = "…\n" + cleaned[-1200:]
+
+    lines = cleaned.splitlines() if cleaned else ["Working through the request…"]
+    if len(lines) > 12:
+        lines = ["…"] + lines[-11:]
+
+    preview = Text(_display_text("\n".join(lines)), style="dim")
+    stats = Text(style="dim")
+    elapsed = max(0.0, time.time() - start_time)
+    if elapsed < 60:
+        stats.append(f"{elapsed:.0f}s")
+    else:
+        mins, secs = divmod(elapsed, 60)
+        stats.append(f"{mins:.0f}m {secs:.0f}s")
+    if tokens > 0:
+        stats.append(f"  ·  {tokens} tokens")
+    if tps > 0:
+        stats.append(f"  ·  {tps:.0f} tok/s", style="dim cyan")
+
+    title = "thinking"
+    if UI_LANG == "ar":
+        title = _display_text("تفكير")
+    elif UI_LANG == "fr":
+        title = "réflexion"
+
+    return Panel(
+        Group(preview, stats),
+        title=f"[bold magenta]{title}[/]",
+        title_align="left",
+        border_style="magenta",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
 
 def show_result(result, tool_name=None):
     if not result or result == "(no output)":
@@ -1516,35 +2812,50 @@ def show_result(result, tool_name=None):
 
     # ── Bash: styled output panel ──
     if tool_name == "bash":
-        lines = result.split('\n')
+        lines = result.split("\n")
         output = "\n".join(lines[:12])
         if len(lines) > 12:
-            output += f"\n\033[2m… {len(lines)-12} more lines\033[0m"
-        is_error = result.startswith("Error") or "error" in result[:100].lower() or "Traceback" in result[:100]
+            output += f"\n\033[2m… {len(lines) - 12} more lines\033[0m"
+        is_error = (
+            result.startswith("Error")
+            or "error" in result[:100].lower()
+            or "Traceback" in result[:100]
+        )
         border = "red" if is_error else "yellow"
-        console.print(Panel(
-            output, border_style=border, padding=(0, 1),
-            title="[dim]output[/]" if not is_error else "[red]error[/]",
-            title_align="left",
-        ))
+        console.print(
+            Panel(
+                output,
+                border_style=border,
+                padding=(0, 1),
+                title="[dim]output[/]" if not is_error else "[red]error[/]",
+                title_align="left",
+            )
+        )
         _auto_preview_images(result)
         return
 
     # ── Read file: compact preview ──
     if tool_name == "read_file":
-        lines = result.split('\n')
+        lines = result.split("\n")
         output = "\n".join(lines[:10])
         if len(lines) > 10:
-            output += f"\n… {len(lines)-10} more lines"
-        console.print(Panel(output, border_style="blue", padding=(0, 1),
-                            title="[dim]content[/]", title_align="left"))
+            output += f"\n… {len(lines) - 10} more lines"
+        console.print(
+            Panel(
+                output,
+                border_style="blue",
+                padding=(0, 1),
+                title="[dim]content[/]",
+                title_align="left",
+            )
+        )
         return
 
     # ── Default: truncated panel ──
-    lines = result.split('\n')
+    lines = result.split("\n")
     output = "\n".join(lines[:10])
     if len(lines) > 10:
-        output += f"\n… ({len(lines)-10} more lines)"
+        output += f"\n… ({len(lines) - 10} more lines)"
     console.print(Panel(output, border_style="dim", padding=(0, 1)))
 
     # Auto-preview any image files mentioned in tool output
@@ -1562,8 +2873,12 @@ def _show_search_results(result):
     entries = [e for e in (parts[1:] if len(parts) > 1 else parts) if e.strip()]
 
     table = Table(
-        show_header=False, show_edge=False, pad_edge=False,
-        padding=(0, 1), expand=True, box=None,
+        show_header=False,
+        show_edge=False,
+        pad_edge=False,
+        padding=(0, 1),
+        expand=True,
+        box=None,
     )
     table.add_column(ratio=1)
 
@@ -1573,13 +2888,17 @@ def _show_search_results(result):
             continue
 
         # Parse markdown-style [title](url)\nsnippet
-        md_match = re.match(r'\[([^\]]+)\]\(([^)]+)\)\n?(.*)', entry, re.DOTALL)
+        md_match = re.match(r"\[([^\]]+)\]\(([^)]+)\)\n?(.*)", entry, re.DOTALL)
         if md_match:
-            title, url, snippet = md_match.group(1), md_match.group(2), md_match.group(3).strip()
+            title, url, snippet = (
+                md_match.group(1),
+                md_match.group(2),
+                md_match.group(3).strip(),
+            )
         else:
             # Image result format: "- Title\n  URL: ...\n  Source: ..."
-            lines = entry.split('\n')
-            title = lines[0].lstrip('- ').strip()
+            lines = entry.split("\n")
+            title = lines[0].lstrip("- ").strip()
             url = ""
             snippet = ""
             for line in lines[1:]:
@@ -1590,7 +2909,7 @@ def _show_search_results(result):
 
         # Build styled entry
         row = Text()
-        row.append(f"  {i+1}. ", style="bold cyan")
+        row.append(f"  {i + 1}. ", style="bold cyan")
         row.append(title, style="bold white")
         row.append("\n")
         if url:
@@ -1610,21 +2929,24 @@ def _show_search_results(result):
     title_text.append(f'"{query}"', style="bold white")
     title_text.append(f"  ({len(entries)} results)", style="dim")
 
-    console.print(Panel(
-        table,
-        title=title_text, title_align="left",
-        border_style="magenta",
-        padding=(0, 0),
-    ))
+    console.print(
+        Panel(
+            table,
+            title=title_text,
+            title_align="left",
+            border_style="magenta",
+            padding=(0, 0),
+        )
+    )
 
 
 def _show_fetch_result(result):
     """Render fetch_url results with status and clean preview."""
-    lines = result.split('\n')
+    lines = result.split("\n")
     status_line = lines[0] if lines else ""
 
     # Extract status code
-    status_match = re.search(r'Status:\s*(\d+)', status_line)
+    status_match = re.search(r"Status:\s*(\d+)", status_line)
     status = status_match.group(1) if status_match else "?"
     status_style = "green" if status == "200" else "yellow"
 
@@ -1632,18 +2954,132 @@ def _show_fetch_result(result):
     content_lines = lines[1:]
     preview = "\n".join(content_lines[:8])
     if len(content_lines) > 8:
-        preview += f"\n... ({len(content_lines)-8} more lines)"
+        preview += f"\n... ({len(content_lines) - 8} more lines)"
 
     title_text = Text()
     title_text.append(" fetch ", style="bold blue")
     title_text.append(f"[{status}]", style=f"bold {status_style}")
 
-    console.print(Panel(
-        preview,
-        title=title_text, title_align="left",
-        border_style="blue",
-        padding=(0, 1),
-    ))
+    console.print(
+        Panel(
+            preview,
+            title=title_text,
+            title_align="left",
+            border_style="blue",
+            padding=(0, 1),
+        )
+    )
+
+
+# ── Piper TTS talk-back ──
+_piper_bin = None
+_piper_voice = None
+_piper_available = False
+
+
+def _init_piper():
+    """Detect piper binary and Arabic voice model."""
+    global _piper_bin, _piper_voice, _piper_available
+    import shutil as _sh
+
+    _piper_bin = _sh.which("piper")
+    if not _piper_bin:
+        # Check common install locations
+        for p in [
+            os.path.expanduser("~/.local/bin/piper"),
+            "/opt/homebrew/bin/piper",
+            os.path.expanduser("~/.local/share/piper/piper"),
+        ]:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                _piper_bin = p
+                break
+    if not _piper_bin:
+        return
+    # Find voice model based on UI language
+    voices_dir = os.path.expanduser("~/.local/share/piper/voices")
+    lang_map = {
+        "ar": ["ar_JO-kareem-medium", "ar_JO-kareem-low", "ar"],
+        "fr": ["fr_FR-siwis-medium", "fr_FR-upmc-medium", "fr"],
+        "en": ["en_US-lessac-medium", "en_US-amy-medium", "en"],
+    }
+    prefixes = lang_map.get(UI_LANG, lang_map["en"])
+    for prefix in prefixes:
+        for ext in [".onnx"]:
+            # Check voices directory
+            voice_path = os.path.join(voices_dir, f"{prefix}{ext}")
+            if os.path.isfile(voice_path):
+                _piper_voice = voice_path
+                _piper_available = True
+                return
+            # Check if model name works directly (piper downloads on demand)
+            # Try the model name without path
+            if "/" not in prefix and not prefix.endswith(".onnx"):
+                _piper_voice = prefix
+                _piper_available = True
+                return
+
+
+try:
+    _init_piper()
+except Exception:
+    pass
+
+
+def speak_text(text, background=True):
+    """Speak text using Piper TTS. Runs in background by default."""
+    if not _piper_available or not text:
+        return
+    # Strip markdown/code blocks — only speak plain text
+    plain = re.sub(r"```[\s\S]*?```", "", text)  # remove code blocks
+    plain = re.sub(r"`[^`]+`", "", plain)  # remove inline code
+    plain = re.sub(r"\[.*?\]", "", plain)  # remove markdown links
+    plain = re.sub(r"[#*_~>]", "", plain)  # remove markdown formatting
+    plain = re.sub(r"https?://\S+", "", plain)  # remove URLs
+    plain = plain.strip()
+    if not plain or len(plain) < 3:
+        return
+    # Truncate long responses — speak first ~200 chars
+    if len(plain) > 200:
+        # Find sentence boundary
+        for sep in [". ", "。", "। ", ".\n", "\n\n"]:
+            idx = plain.find(sep, 80)
+            if idx > 0:
+                plain = plain[: idx + 1]
+                break
+        else:
+            plain = plain[:200]
+
+    def _speak():
+        try:
+            wav_path = os.path.join(CWD, ".localcoder-tts.wav")
+            # Pipe text to piper
+            proc = subprocess.run(
+                [_piper_bin, "--model", _piper_voice, "--output_file", wav_path],
+                input=plain,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0 and os.path.isfile(wav_path):
+                # Play audio (macOS: afplay, Linux: aplay)
+                player = "afplay" if sys.platform == "darwin" else "aplay"
+                subprocess.run(
+                    [player, wav_path],
+                    capture_output=True,
+                    timeout=30,
+                )
+                try:
+                    os.unlink(wav_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if background:
+        threading.Thread(target=_speak, daemon=True).start()
+    else:
+        _speak()
+
 
 def show_response(text):
     """Render model response as markdown with proper formatting.
@@ -1652,10 +3088,13 @@ def show_response(text):
         return
     console.print()
     try:
-        md = Markdown(text, code_theme="monokai")
-        console.print(md, width=min(console.width - 4, 100))
+        if UI_LANG == "ar" or _contains_arabic(text):
+            console.print(Text(_display_text(text), style="white"), width=min(console.width - 4, 100))
+        else:
+            md = Markdown(text, code_theme="monokai")
+            console.print(md, width=min(console.width - 4, 100))
     except:
-        console.print(text)
+        console.print(_display_text(text))
     console.print()
 
     # Auto-detect and preview images from response
@@ -1664,28 +3103,35 @@ def show_response(text):
 
 def _auto_preview_images(text):
     """Detect image URLs and local file paths in text, preview them inline."""
-    IMG_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.bmp')
+    # 1. Image URLs — accept direct image links, markdown links, and common image hosts.
+    img_urls = []
+    img_urls += re.findall(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", text)
+    img_urls += re.findall(r"\[[^\]]+\]\((https?://[^)\s]+)\)", text)
+    img_urls += re.findall(r"(https?://[^\s\)\]\"']+\.(?:png|jpg|jpeg|webp|gif|svg|bmp)(?:\?[^\s\)]*)?)", text)
+    img_urls += re.findall(r"(https?://[^\s\)\]\"']+)", text)
 
-    # 1. Image URLs — download and display
-    img_urls = re.findall(r'(https?://[^\s\)\]\"\']+\.(?:png|jpg|jpeg|webp|gif))', text)
-    for url in img_urls[:3]:
+    seen = set()
+    previewed = 0
+    for raw_url in img_urls:
+        url = raw_url.rstrip(").,]>")
+        if url in seen:
+            continue
+        seen.add(url)
+        if previewed >= 3:
+            break
         try:
-            img_name = os.path.basename(url.split("?")[0])[:40] or "image.jpg"
-            img_path = os.path.join(CWD, img_name)
-            if not os.path.exists(img_path):
-                subprocess.run(
-                    ["curl", "-fsSL", "-A", "Mozilla/5.0", "-o", img_path, url],
-                    capture_output=True, timeout=10,
-                )
-            if os.path.isfile(img_path) and os.path.getsize(img_path) > 500:
-                if _is_image_file(img_path):
-                    show_image_inline(img_path)
+            if show_image_url(url):
+                previewed += 1
         except Exception:
             pass
 
     # 2. Local file paths — detect and preview
-    local_paths = re.findall(r'(?:^|\s)([/~][\w/.\-]+\.(?:png|jpg|jpeg|webp|gif|svg|bmp))', text)
-    local_paths += re.findall(r'(?:^|\s)(\.\/[\w/.\-]+\.(?:png|jpg|jpeg|webp|gif|svg|bmp))', text)
+    local_paths = re.findall(
+        r"(?:^|\s)([/~][\w/.\-]+\.(?:png|jpg|jpeg|webp|gif|svg|bmp))", text
+    )
+    local_paths += re.findall(
+        r"(?:^|\s)(\.\/[\w/.\-]+\.(?:png|jpg|jpeg|webp|gif|svg|bmp))", text
+    )
     for path in local_paths[:3]:
         path = os.path.expanduser(path.strip())
         if not os.path.isabs(path):
@@ -1697,38 +3143,68 @@ def _auto_preview_images(text):
     # (handled by show_result already)
 
 
+def _extract_preview_image_url(page_url, html_text):
+    patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<img[^>]+src=["\']([^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            return urllib.parse.urljoin(page_url, match.group(1).strip())
+    return None
+
+
 def _is_image_file(path):
     """Check file header to verify it's a real image."""
     try:
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             hdr = f.read(8)
-        return (hdr[:2] == b'\xff\xd8' or hdr[:4] == b'\x89PNG' or
-                hdr[:4] == b'GIF8' or hdr[:4] == b'RIFF' or
-                b'<svg' in open(path, 'rb').read(200))
+        return (
+            hdr[:2] == b"\xff\xd8"
+            or hdr[:4] == b"\x89PNG"
+            or hdr[:4] == b"GIF8"
+            or hdr[:4] == b"RIFF"
+            or hdr[4:12] in (b"ftypavif", b"ftypavis", b"ftypheic", b"ftypheif")
+            or b"<svg" in open(path, "rb").read(200)
+        )
     except Exception:
         return False
 
 
-def show_image_url(url, max_width=50, max_height=15):
+def show_image_url(url, max_width=50, max_height=15, _depth=0):
     """Download and display an image URL inline in terminal."""
+    if _depth > 1:
+        return False
     try:
         img_name = os.path.basename(url.split("?")[0])[:30] or "preview.jpg"
         img_path = os.path.join("/tmp", f"localcoder-{img_name}")
         subprocess.run(
             ["curl", "-fsSL", "-A", "Mozilla/5.0", "-o", img_path, url],
-            capture_output=True, timeout=10,
+            capture_output=True,
+            timeout=10,
         )
         if os.path.isfile(img_path) and os.path.getsize(img_path) > 500:
-            timg = "/opt/homebrew/bin/timg"
-            if os.path.exists(timg):
-                proto = "i" if os.environ.get("TERM_PROGRAM", "").startswith("iTerm") else "h"
-                subprocess.run([timg, "-g", f"{max_width}x{max_height}", "-p", proto, img_path], timeout=5)
-                return True
+            if not _is_image_file(img_path):
+                try:
+                    with open(img_path, "rb") as f:
+                        html = f.read(120_000).decode("utf-8", errors="ignore")
+                    nested = _extract_preview_image_url(url, html)
+                    if nested and nested != url:
+                        return show_image_url(nested, max_width=max_width, max_height=max_height, _depth=_depth + 1)
+                except Exception:
+                    pass
+                return False
+            show_image_inline(img_path)
+            return True
     except Exception:
         pass
     return False
 
+
 # print_thinking is now handled by ThinkingSpinner from localcoder.localcoder_display
+
 
 # ── Permissions ──
 # ── Sandbox ──
@@ -1737,38 +3213,97 @@ class Sandbox:
 
     # Bash commands that are ALWAYS blocked in sandbox
     BLOCKED_CMDS = [
-        "rm -rf", "rm -r", "rmdir", "mkfs", "dd if=",
-        "sudo", "> /dev/", "chmod 777",
-        "| sh", "| bash", "| zsh",  # pipe to shell
-        "| python", "| perl", "| ruby",  # pipe to interpreter
-        "eval ", "exec ",
-        "ssh ", "scp ", "rsync ",
-        "kill -9", "killall", "pkill",
-        "launchctl", "defaults write",
-        "networksetup", "osascript.*delete",
+        "rm -rf",
+        "rm -r",
+        "rmdir",
+        "mkfs",
+        "dd if=",
+        "sudo",
+        "> /dev/",
+        "chmod 777",
+        "| sh",
+        "| bash",
+        "| zsh",  # pipe to shell
+        "| python",
+        "| perl",
+        "| ruby",  # pipe to interpreter
+        "eval ",
+        "exec ",
+        "ssh ",
+        "scp ",
+        "rsync ",
+        "kill -9",
+        "killall",
+        "pkill",
+        "launchctl",
+        "defaults write",
+        "networksetup",
+        "osascript.*delete",
     ]
 
     # Paths that are NEVER writable in sandbox
     BLOCKED_PATHS = [
-        "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud",
-        "~/.env", "~/.bashrc", "~/.zshrc", "~/.profile",
-        "~/.bash_profile", "~/.netrc", "~/.npmrc",
-        "~/.pypirc", "~/.docker", "~/.kube",
-        "/etc/", "/usr/", "/System/", "/Library/",
+        "~/.ssh",
+        "~/.aws",
+        "~/.gnupg",
+        "~/.config/gcloud",
+        "~/.env",
+        "~/.bashrc",
+        "~/.zshrc",
+        "~/.profile",
+        "~/.bash_profile",
+        "~/.netrc",
+        "~/.npmrc",
+        "~/.pypirc",
+        "~/.docker",
+        "~/.kube",
+        "/etc/",
+        "/usr/",
+        "/System/",
+        "/Library/",
         "~/.localcoder/config.json",  # protect own config
     ]
 
     # Bash commands allowed in sandbox (read-only operations)
     SAFE_PREFIXES = [
-        "ls", "cat", "head", "tail", "less", "more",
-        "find", "grep", "rg", "ag", "fd",
-        "wc", "sort", "uniq", "diff", "file", "stat",
-        "git status", "git diff", "git log", "git show", "git blame",
-        "git branch", "git remote", "git stash list",
-        "echo", "printf", "which", "type", "man",
-        "python3 -c", "node -e",  # allow one-liner execution
-        "npm list", "pip list", "pip show",
-        "curl -fsSL", "curl -sL", "curl -s",  # GET requests only
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "find",
+        "grep",
+        "rg",
+        "ag",
+        "fd",
+        "wc",
+        "sort",
+        "uniq",
+        "diff",
+        "file",
+        "stat",
+        "git status",
+        "git diff",
+        "git log",
+        "git show",
+        "git blame",
+        "git branch",
+        "git remote",
+        "git stash list",
+        "echo",
+        "printf",
+        "which",
+        "type",
+        "man",
+        "python3 -c",
+        "node -e",  # allow one-liner execution
+        "npm list",
+        "pip list",
+        "pip show",
+        "curl -fsSL",
+        "curl -sL",
+        "curl -s",  # GET requests only
         "open ",  # open files/URLs
         "timg",  # image display
     ]
@@ -1787,7 +3322,10 @@ class Sandbox:
         for path in Sandbox.BLOCKED_PATHS:
             expanded = os.path.expanduser(path)
             if expanded in cmd or path in cmd:
-                return False, f"Blocked: writing to '{path}' not allowed in sandbox mode"
+                return (
+                    False,
+                    f"Blocked: writing to '{path}' not allowed in sandbox mode",
+                )
 
         return True, ""
 
@@ -1852,7 +3390,9 @@ class Permissions:
                 allowed, reason = Sandbox.is_bash_allowed(cmd)
                 if not allowed:
                     console.print(f"  [red]🛡 {reason}[/]")
-                    console.print(f"  [dim]Run with --unrestricted to disable sandbox[/]")
+                    console.print(
+                        f"  [dim]Run with --unrestricted to disable sandbox[/]"
+                    )
                     return False
 
             if fname in ("write_file", "edit_file") and args:
@@ -1874,12 +3414,16 @@ class Permissions:
         if self.mode == "auto" and fname in self.SAFE:
             return True
 
-        console.print(Panel(
-            f"[bold yellow]Allow [white]{fname}[/white]?[/]  [dim]y[/]es · [dim]n[/]o · [dim]a[/]lways",
-            border_style="yellow", padding=(0, 1),
-        ))
+        console.print(
+            Panel(
+                f"[bold yellow]Allow [white]{fname}[/white]?[/]  [dim]y[/]es · [dim]n[/]o · [dim]a[/]lways",
+                border_style="yellow",
+                padding=(0, 1),
+            )
+        )
         # Flush any leftover input from streaming
         import termios
+
         try:
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
         except Exception:
@@ -1914,6 +3458,7 @@ class Permissions:
         console.print(f"  [red]✗ denied[/]")
         return False
 
+
 # ── Agent loop ──
 def agent_loop(messages, perms):
     total_tokens = 0
@@ -1924,11 +3469,32 @@ def agent_loop(messages, perms):
     for turn in range(25):
         spinner.start()
         spinner.update(tokens=total_tokens)
+        messages_for_call = messages
+        last_user_text = ""
+        for _msg in reversed(messages):
+            if _msg.get("role") == "user" and isinstance(_msg.get("content"), str):
+                last_user_text = _msg.get("content", "")
+                break
+        if _is_image_only_request(last_user_text):
+            messages_for_call = messages + [
+                {
+                    "role": "system",
+                    "content": (
+                        "The latest user request is image-only. "
+                        "Do not inspect skills. Do not write files. Do not build HTML. "
+                        "Use web_search for a REAL direct photo URL first. "
+                        "If results are article pages, use fetch_url to extract lead images via Jina Reader. "
+                        "Return the best direct real-photo URL and at most one fallback."
+                    ),
+                }
+            ]
         try:
-            resp = chat_api(messages, spinner=spinner)
+            resp = chat_api(messages_for_call, spinner=spinner)
         except urllib.error.URLError:
             spinner.stop()
-            console.print("[bold red]  ✗ API timeout — context full. Auto-clearing old messages.[/]")
+            console.print(
+                "[bold red]  ✗ API timeout — context full. Auto-clearing old messages.[/]"
+            )
             if len(messages) > 3:
                 messages[:] = [messages[0]] + messages[-2:]
                 continue
@@ -1959,26 +3525,33 @@ def agent_loop(messages, perms):
         reasoning_text = msg.get("reasoning_content", "").strip()
         if not content_text and reasoning_text:
             content_text = reasoning_text
-        content_text = re.sub(r'<\|?channel\|?>', '', content_text).strip()
+        content_text = re.sub(r"<\|?channel\|?>", "", content_text).strip()
         # Text was already streamed live by chat_api — only show via
         # markdown if it came from reasoning_content fallback
         if content_text and not msg.get("content", "").strip():
             show_response(content_text)
 
         if not msg.get("tool_calls"):
+            if content_text:
+                _auto_preview_images(content_text)
             elapsed = time.time() - loop_start
             if elapsed < 60:
                 t = f"{elapsed:.0f}s"
             else:
                 m, s = divmod(elapsed, 60)
                 t = f"{m:.0f}m {s:.0f}s"
-            console.print(f"\n  [dim]✦ {t} · {total_tokens} tokens · {tps:.0f} tok/s[/]")
+            console.print(
+                f"\n  [dim]✦ {t} · {total_tokens} tokens · {tps:.0f} tok/s[/]"
+            )
             # Show context usage after completion
             ctx_str = BACKEND_INFO.get("ctx", "")
             if ctx_str:
                 ctx_max = int(ctx_str.replace("K", "")) * 1024
                 ctx_used = estimate_tokens(json.dumps(messages))
                 context_usage_bar(console, ctx_used, ctx_max)
+            # TTS talk-back — speak the response in background
+            if _piper_available and content_text and UI_LANG in ("ar", "fr"):
+                speak_text(content_text)
             break
 
         messages.append(msg)
@@ -1994,14 +3567,14 @@ def agent_loop(messages, perms):
             if fname == "bash" and args.get("command", "").startswith("cat "):
                 tool_sig = f"read:{args['command'].split()[-1]}"
             elif fname == "read_file":
-                tool_sig = f"read:{args.get('path','')}"
+                tool_sig = f"read:{args.get('path', '')}"
             elif fname == "fetch_url":
-                tool_sig = f"fetch:{args.get('url','')[:50]}"
+                tool_sig = f"fetch:{args.get('url', '')[:50]}"
             else:
                 tool_sig = f"{fname}:{json.dumps(args)[:60]}"
             recent_tools.append(tool_sig)
             # Track consecutive errors
-            if not hasattr(agent_loop, '_error_count'):
+            if not hasattr(agent_loop, "_error_count"):
                 agent_loop._error_count = 0
 
             if len(recent_tools) >= 3:
@@ -2018,38 +3591,59 @@ def agent_loop(messages, perms):
                         # First loop — force model to act
                         self_corrected = True
                         console.print("  [yellow]⚠ Loop detected — redirecting...[/]")
-                        messages.append({"role": "tool", "tool_call_id": tc["id"],
-                            "content": "LOOP DETECTED: You already have this data. STOP reading the same file. "
-                                       "You have all the information you need. NOW ACT:\n"
-                                       "1. If the user asked to build an app — START writing code with write_file\n"
-                                       "2. If you need more data from a URL — use web_search or fetch_url\n"
-                                       "3. If you need to run something — use bash\n"
-                                       "DO NOT read the same file again. Use write_file to create the output NOW."})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": "LOOP DETECTED: You already have this data. STOP reading the same file. "
+                                "You have all the information you need. NOW ACT:\n"
+                                "1. If the user asked to build an app — START writing code with write_file\n"
+                                "2. If you need more data from a URL — use web_search or fetch_url\n"
+                                "3. If you need to run something — use bash\n"
+                                "DO NOT read the same file again. Use write_file to create the output NOW.",
+                            }
+                        )
                         recent_tools.clear()
                         continue
                     else:
                         # Second loop — auto-continue, don't block on user input
-                        console.print("  [yellow]⚠ Still looping — forcing action...[/]")
-                        messages.append({"role": "user",
-                            "content": "You are stuck in a loop. STOP reading files. "
-                                       "You already have all the content. "
-                                       "START BUILDING NOW. Use write_file to create the output immediately."})
+                        console.print(
+                            "  [yellow]⚠ Still looping — forcing action...[/]"
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "You are stuck in a loop. STOP reading files. "
+                                "You already have all the content. "
+                                "START BUILDING NOW. Use write_file to create the output immediately.",
+                            }
+                        )
                         self_corrected = False
                         recent_tools.clear()
                         continue
 
             show_tool_call(fname, args)
-            logging.getLogger("localcoder").info(f"Tool: {fname}({json.dumps(args)[:200]})")
+            logging.getLogger("localcoder").info(
+                f"Tool: {fname}({json.dumps(args)[:200]})"
+            )
 
             if not perms.check(fname, args):
                 logging.getLogger("localcoder").info(f"Tool denied: {fname}")
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "Denied by user."})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": "Denied by user.",
+                    }
+                )
                 continue
 
             try:
                 t0 = time.time()
                 result = exec_tool(fname, args)
-                logging.getLogger("localcoder").info(f"Tool result: {fname} → {len(result)} chars in {time.time()-t0:.1f}s")
+                logging.getLogger("localcoder").info(
+                    f"Tool result: {fname} → {len(result)} chars in {time.time() - t0:.1f}s"
+                )
             except Exception as e:
                 result = f"Error: {e}"
                 logging.getLogger("localcoder").error(f"Tool error: {fname} → {e}")
@@ -2061,16 +3655,32 @@ def agent_loop(messages, perms):
             # (built into the tool itself, ADK-style)
 
             # Detect repeated errors — if 3+ consecutive bash errors, tell model to web_search
-            if fname == "bash" and result and ("error" in result.lower() or "Error" in result):
+            if (
+                fname == "bash"
+                and result
+                and ("error" in result.lower() or "Error" in result)
+            ):
                 agent_loop._error_count += 1
                 if agent_loop._error_count >= 3:
-                    console.print("  [yellow]⚠ 3 consecutive errors — suggesting web search...[/]")
-                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result[:1500]})
-                    messages.append({"role": "user",
-                        "content": "You've had 3 consecutive errors with this approach. "
-                                   "STOP trying variations of the same command. "
-                                   "Use web_search to find the correct way to do this on macOS. "
-                                   "Search for the specific error message or task."})
+                    console.print(
+                        "  [yellow]⚠ 3 consecutive errors — suggesting web search...[/]"
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result[:1500],
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "You've had 3 consecutive errors with this approach. "
+                            "STOP trying variations of the same command. "
+                            "Use web_search to find the correct way to do this on macOS. "
+                            "Search for the specific error message or task.",
+                        }
+                    )
                     agent_loop._error_count = 0
                     recent_tools.clear()
                     continue
@@ -2082,7 +3692,10 @@ def agent_loop(messages, perms):
                 now = time.time()
                 candidates = []
                 for fn in os.listdir(CWD):
-                    if any(fn.lower().endswith(e) for e in ('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+                    if any(
+                        fn.lower().endswith(e)
+                        for e in (".png", ".jpg", ".jpeg", ".webp", ".gif")
+                    ):
                         fp = os.path.join(CWD, fn)
                         if os.path.getmtime(fp) > now - 5:
                             candidates.append((os.path.getmtime(fp), fp, fn))
@@ -2090,24 +3703,42 @@ def agent_loop(messages, perms):
                     candidates.sort(reverse=True)
                     _, fp, fn = candidates[0]
                     try:
-                        with open(fp, 'rb') as img_f:
+                        with open(fp, "rb") as img_f:
                             header = img_f.read(16)
-                        is_image = (header[:8] == b'\x89PNG\r\n\x1a\n' or
-                                    header[:2] == b'\xff\xd8' or
-                                    header[:4] == b'GIF8' or
-                                    header[:4] == b'RIFF')
+                        is_image = (
+                            header[:8] == b"\x89PNG\r\n\x1a\n"
+                            or header[:2] == b"\xff\xd8"
+                            or header[:4] == b"GIF8"
+                            or header[:4] == b"RIFF"
+                        )
                         if is_image:
                             show_image_inline(fp)
                             result += "\n[IMAGE DISPLAYED INLINE IN TERMINAL]"
                         else:
-                            console.print(f"  [red]⚠ {fn} is not a valid image (server returned HTML). Try a different URL.[/]")
+                            console.print(
+                                f"  [red]⚠ {fn} is not a valid image (server returned HTML). Try a different URL.[/]"
+                            )
                             result += f"\n[ERROR: Downloaded file {fn} is NOT an image. The server returned HTML. Try a completely different image source — avoid wikimedia SVG thumbnails.]"
                     except Exception as img_err:
-                        logging.getLogger("localcoder").error(f"Image check error: {img_err}")
+                        logging.getLogger("localcoder").error(
+                            f"Image check error: {img_err}"
+                        )
 
             # Keep more for fetch_url (has images), less for others
-            max_len = 5000 if fname == "read_pdf" else 2500 if fname in ("fetch_url", "web_search") else 1500
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)[:max_len]})
+            max_len = (
+                5000
+                if fname == "read_pdf"
+                else 2500
+                if fname in ("fetch_url", "web_search")
+                else 1500
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": str(result)[:max_len],
+                }
+            )
 
         tokens = usage.get("completion_tokens", 0) if usage else 0
         stats = Text()
@@ -2121,12 +3752,14 @@ def agent_loop(messages, perms):
 
     return total_tokens
 
+
 # ── Banner ──
 def _model_label():
     bi = BACKEND_INFO
     name = f"Gemma 4 {bi['size']}" if bi["size"] else bi["model_name"]
     quant = f" {bi['quant']}" if bi["quant"] else ""
     return f"{name}{quant}"
+
 
 LOGO_TEXT = [
     ("[bold #e07a5f]██╗      ██████╗  ██████╗ █████╗ ██╗     [/]",),
@@ -2154,6 +3787,7 @@ def show_banner():
     gpu_str = ""
     try:
         from localcoder.backends import get_metal_gpu_stats, get_swap_usage_mb, MODELS
+
         metal = get_metal_gpu_stats()
         swap = get_swap_usage_mb()
         gt = metal.get("total_mb", 0)
@@ -2175,10 +3809,17 @@ def show_banner():
     from rich.console import Group
     from rich.live import Live
 
+    # Terminal centering — center the 50-char-wide logo box
+    try:
+        _tw = os.get_terminal_size().columns
+    except Exception:
+        _tw = 80
+    _cpad = " " * max(0, (_tw - 50) // 2)
+
     console.print()
 
-    gpu_icon = "[green]●[/]" if bi.get('gpu') else "[yellow]●[/]"
-    status_line = f"  {gpu_icon} [bold cyan]{ml}[/]  ·  {bi['backend']}  ·  {bi['ctx'] or '?'} context  ·  {gpu_str}  ·  [green]$0.00[/]"
+    gpu_icon = "[green]●[/]" if bi.get("gpu") else "[yellow]●[/]"
+    status_line = f"{_cpad}{gpu_icon} [bold cyan]{ml}[/]  ·  {bi['backend']}  ·  {bi['ctx'] or '?'} context  ·  {gpu_str}  ·  [green]$0.00[/]"
 
     # ── Pre-designed frames (Copilot-style: each frame is a complete screen) ──
     def _frame(*lines):
@@ -2189,16 +3830,18 @@ def show_banner():
 
     # Helper: build bordered logo frame with optional extras below
     def _logo_frame(reveal_cols=99, scan=False, subtitle="", extras=None):
-        lines = [f"  [{B}]┌──────────────────────────────────────────────────┐[/]"]
+        lines = [f"{_cpad}[{B}]┌──────────────────────────────────────────────────┐[/]"]
         for r, lt in enumerate(LOGO_TEXT):
             raw = lt[0]
-            color = raw.split(']')[0] + ']'
-            plain = raw.replace('[/]', '').split(']')[-1] if ']' in raw else raw
+            color = raw.split("]")[0] + "]"
+            plain = raw.replace("[/]", "").split("]")[-1] if "]" in raw else raw
             shown = plain[:reveal_cols]
             cursor = f"[white bold]▌[/]" if scan and reveal_cols < len(plain) else ""
             rest = " " * max(0, 48 - len(shown) - (1 if cursor else 0))
-            lines.append(f"  [{B}]│[/]{color}{shown}[/]{cursor}{rest}[{B}]│[/]")
-        lines.append(f"  [{B}]└──────────────────────────────────────────────────┘[/]")
+            lines.append(f"{_cpad}[{B}]│[/]{color}{shown}[/]{cursor}{rest}[{B}]│[/]")
+        lines.append(
+            f"{_cpad}[{B}]└──────────────────────────────────────────────────┘[/]"
+        )
         if subtitle:
             lines.append(subtitle)
         if extras:
@@ -2207,21 +3850,20 @@ def show_banner():
 
     try:
         with Live(console=console, refresh_per_second=20, transient=True) as live:
-
             # Act 1: Border materializes (corners → edges → full)
             corners = [
-                f"  [{B}]┌┐[/]",
+                f"{_cpad}[{B}]┌┐[/]",
                 *["" for _ in range(12)],
-                f"  [{B}]└┘[/]",
+                f"{_cpad}[{B}]└┘[/]",
             ]
             live.update(_frame(*corners))
             time.sleep(0.07)
 
             for w in [12, 24, 36, 48]:
-                lines = [f"  [{B}]┌{'─' * w}{'─' * (48 - w)}┐[/]"]
+                lines = [f"{_cpad}[{B}]┌{'─' * w}{'─' * (48 - w)}┐[/]"]
                 for _ in range(12):
-                    lines.append(f"  [{B}]│[/]{' ' * 48}[{B}]│[/]")
-                lines.append(f"  [{B}]└{'─' * w}{'─' * (48 - w)}┘[/]")
+                    lines.append(f"{_cpad}[{B}]│[/]{' ' * 48}[{B}]│[/]")
+                lines.append(f"{_cpad}[{B}]└{'─' * w}{'─' * (48 - w)}┘[/]")
                 live.update(_frame(*lines))
                 time.sleep(0.04)
 
@@ -2235,9 +3877,9 @@ def show_banner():
             time.sleep(0.12)
 
             subs = [
-                f"  [{B}]✦[/] [dim]Command-line[/]",
-                f"  [{B}]✦[/] [dim]Command-line interface[/]",
-                f"  [{B}]✦[/] [dim]Command-line interface[/]  [bold {G}]✓ offline[/]",
+                f"{_cpad}[{B}]✦[/] [dim]{_ui('Command-line', 'واجهة سطر', 'Interface en ligne')}[/]",
+                f"{_cpad}[{B}]✦[/] [dim]{_ui('Command-line interface', 'واجهة سطر الأوامر', 'Interface en ligne de commande')}[/]",
+                f"{_cpad}[{B}]✦[/] [dim]{_ui('Command-line interface', 'واجهة سطر الأوامر', 'Interface en ligne de commande')}[/]  [bold {G}]{_ui('✓ offline', '✓ بدون إنترنت', '✓ hors ligne')}[/]",
             ]
             for s in subs:
                 live.update(_logo_frame(reveal_cols=99, subtitle=s))
@@ -2246,50 +3888,92 @@ def show_banner():
             # Act 4: Description + status appear
             desc = [
                 "",
-                f"  Write, test, and debug code right from your terminal.",
-                f"  Runs [bold]100% on your GPU[/]. No API keys. No cloud. Enter [bold]?[/] for help.",
+                f"{_cpad}{_ui('Write, test, and debug code right from your terminal.', 'اكتب واختبر وصحح الأكواد مباشرة من الطرفية.', 'Écrivez, testez et déboguez du code depuis votre terminal.')}",
+                f"{_cpad}{_ui('Runs [bold]100% on your GPU[/]. No API keys. No cloud. Enter [bold]?[/] for help.', 'يعمل [bold]100% على GPU[/]. بدون مفاتيح API. بدون سحابة. اكتب [bold]?[/] للمساعدة.', 'Tourne [bold]100% sur votre GPU[/]. Pas de clés API. Pas de cloud. Tapez [bold]?[/] pour l\u2019aide.')}",
             ]
             live.update(_logo_frame(reveal_cols=99, subtitle=subs[-1], extras=desc))
             time.sleep(0.2)
 
-            full_extras = desc + ["", status_line, f"  [dim]{os.path.basename(CWD)}/[/]", ""]
-            live.update(_logo_frame(reveal_cols=99, subtitle=subs[-1], extras=full_extras))
+            full_extras = desc + [
+                "",
+                status_line,
+                f"{_cpad}[dim]{os.path.basename(CWD)}/[/]",
+                "",
+            ]
+            live.update(
+                _logo_frame(reveal_cols=99, subtitle=subs[-1], extras=full_extras)
+            )
             time.sleep(0.5)
 
     except Exception:
         pass
 
-    # ── Static final render ──
-    console.print(f"  [{B}]┌──────────────────────────────────────────────────┐[/]")
+    # ── Static final render (centered, all languages show ASCII art) ──
+    # ASCII art logo — centered
+    console.print(
+        f"{_cpad}[{B}]┌──────────────────────────────────────────────────┐[/]"
+    )
     for lt in LOGO_TEXT:
         raw = lt[0]
-        color = raw.split(']')[0] + ']'
-        plain = raw.replace('[/]', '').split(']')[-1] if ']' in raw else raw
+        color = raw.split("]")[0] + "]"
+        plain = raw.replace("[/]", "").split("]")[-1] if "]" in raw else raw
         pad = " " * max(0, 48 - len(plain))
-        console.print(f"  [{B}]│[/]{lt[0]}{pad}[{B}]│[/]")
-    console.print(f"  [{B}]└──────────────────────────────────────────────────┘[/]")
-    console.print(f"  [{B}]✦[/] [dim]Command-line interface[/]  [bold {G}]✓ offline[/]")
-    console.print()
-    console.print(f"  Write, test, and debug code right from your terminal.")
-    console.print(f"  Runs [bold]100% on your GPU[/]. No API keys. No cloud. Enter [bold]?[/] for help.")
+        console.print(f"{_cpad}[{B}]│[/]{lt[0]}{pad}[{B}]│[/]")
+    console.print(
+        f"{_cpad}[{B}]└──────────────────────────────────────────────────┘[/]"
+    )
+
+    if UI_LANG == "ar":
+        # Arabic: large styled title + subtitle below logo
+        console.print(
+            f"{_cpad}[{B}]✦[/] [dim]{_t('cmd_line')}[/]  [bold {G}]{_t('offline')}[/]"
+        )
+        console.print()
+        console.print(f"{_cpad}[bold #c084fc]  ✦  {_t('banner_title')}  ✦[/]")
+        console.print(f"{_cpad}[dim]  {_t('banner_subtitle')}[/]")
+        console.print()
+        console.print(f"{_cpad}{_t('desc_line1')}")
+        console.print(f"{_cpad}{_t('desc_line2')}")
+    elif UI_LANG == "fr":
+        console.print(
+            f"{_cpad}[{B}]✦[/] [dim]{_t('cmd_line')}[/]  [bold {G}]{_t('offline')}[/]"
+        )
+        console.print()
+        console.print(f"{_cpad}[bold #c084fc]  ✦  LocalCoder  ✦[/]")
+        console.print(f"{_cpad}[dim]  {_t('banner_subtitle')}[/]")
+        console.print()
+        console.print(f"{_cpad}{_t('desc_line1')}")
+        console.print(f"{_cpad}{_t('desc_line2')}")
+    else:
+        console.print(
+            f"{_cpad}[{B}]✦[/] [dim]Command-line interface[/]  [bold {G}]✓ offline[/]"
+        )
+        console.print()
+        console.print(f"{_cpad}Write, test, and debug code right from your terminal.")
+        console.print(
+            f"{_cpad}Runs [bold]100% on your GPU[/]. No API keys. No cloud. Enter [bold]?[/] for help."
+        )
     console.print()
     console.print(status_line)
-    console.print(f"  [dim]{os.path.basename(CWD)}/[/]")
+    console.print(f"{_cpad}[dim]{os.path.basename(CWD)}/[/]")
     console.print()
 
+
 _toolbar_gpu_cache = {"text": "", "ts": 0}
+
 
 def get_toolbar():
     """Bottom toolbar — model + GPU + offline. GPU stats cached (no ioreg per keystroke)."""
     bi = BACKEND_INFO
     ml = _model_label()
-    ctx = bi['ctx'] or '?'
+    ctx = bi["ctx"] or "?"
 
     # Cache GPU part — compute once, reuse for 60s
     gpu_part = _toolbar_gpu_cache["text"]
     if time.time() - _toolbar_gpu_cache["ts"] > 60:
         try:
             from localcoder.backends import MODELS
+
             # Just use model size from registry — no ioreg call
             model_gb = 0
             gt_gb = 16  # default Metal budget
@@ -2306,12 +3990,13 @@ def get_toolbar():
             pass
 
     return HTML(
-        f' <b>{ml}</b>'
+        f" <b>{ml}</b>"
         f' <style bg="ansigreen" fg="ansiblack"> {bi["backend"]} </style>'
         f' <style bg="ansiblue" fg="ansiwhite"> {ctx} </style>'
-        f'{gpu_part}'
-        f' <style bg="ansidarkgray" fg="ansiwhite"> ✓ offline </style>'
+        f"{gpu_part}"
+        f' <style bg="ansidarkgray" fg="ansiwhite"> {_ui("✓ offline", "✓ بدون إنترنت", "✓ hors ligne")} </style>'
     )
+
 
 # ── Main ──
 def main(argv=None):
@@ -2325,31 +4010,65 @@ def main(argv=None):
   localcoder --yolo                     auto-approve everything
   localcoder -m gemma4-e4b              use E4B model
   localcoder -m gemma4-26b --yolo -p "fix the bug"
-""")
+""",
+    )
     parser.add_argument("-p", "--prompt", type=str, help="Run a single task and exit")
-    parser.add_argument("-c", "--continue", dest="cont", action="store_true", help="Continue last session")
-    parser.add_argument("-m", "--model", type=str, default=None, help="Model name (default: gemma4-26b)")
-    parser.add_argument("--yolo", action="store_true", help="Auto-approve all tools (sandbox still active)")
+    parser.add_argument(
+        "-c",
+        "--continue",
+        dest="cont",
+        action="store_true",
+        help="Continue last session",
+    )
+    parser.add_argument(
+        "-m", "--model", type=str, default=None, help="Model name (default: gemma4-26b)"
+    )
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="Auto-approve all tools (sandbox still active)",
+    )
     parser.add_argument("--bypass", action="store_true", help="Same as --yolo")
-    parser.add_argument("--unrestricted", action="store_true", help="Disable sandbox — full system access (dangerous)")
+    parser.add_argument(
+        "--unrestricted",
+        action="store_true",
+        help="Disable sandbox — full system access (dangerous)",
+    )
+    parser.add_argument("-ar", "--arabic", action="store_true", help="Arabic UI")
+    parser.add_argument("-fr", "--french", action="store_true", help="French UI")
     parser.add_argument("--ask", action="store_true", help="Ask before every tool")
-    parser.add_argument("--api", type=str, default=None, help="API base URL (default: http://127.0.0.1:8089/v1)")
+    parser.add_argument(
+        "--api",
+        type=str,
+        default=None,
+        help="API base URL (default: http://127.0.0.1:8089/v1)",
+    )
     args = parser.parse_args(argv)
 
     # Override globals
-    global MODEL, API_BASE
+    global MODEL, API_BASE, UI_LANG
     if args.model:
         MODEL = args.model
     if args.api:
         API_BASE = args.api
+    if getattr(args, "arabic", False):
+        UI_LANG = "ar"
+        os.environ["LOCALCODER_UI_LANG"] = "ar"
+    elif getattr(args, "french", False):
+        UI_LANG = "fr"
+        os.environ["LOCALCODER_UI_LANG"] = "fr"
 
     mode = "bypass" if (args.yolo or args.bypass) else ("ask" if args.ask else "auto")
     sandbox = not args.unrestricted
 
     if args.unrestricted:
-        console.print(f"  [red bold]⚠ UNRESTRICTED MODE — sandbox disabled. Full system access.[/]")
+        console.print(
+            f"  [red bold]{_ui('⚠ UNRESTRICTED MODE — sandbox disabled. Full system access.', '⚠ وضع غير مقيد — الحماية معطلة. وصول كامل للنظام.', '⚠ MODE NON RESTREINT — sandbox désactivé. Accès complet au système.')}[/]"
+        )
     elif args.yolo:
-        console.print(f"  [yellow]Auto-approve mode. Sandbox still active (no rm -rf, no sudo, no writes outside project).[/]")
+        console.print(
+            f"  [yellow]{_ui('Auto-approve mode. Sandbox still active (no rm -rf, no sudo, no writes outside project).', 'وضع الموافقة التلقائية. الحماية مفعلة (بدون rm -rf، بدون sudo، الكتابة داخل المشروع فقط).', 'Mode auto-approbation. Sandbox toujours actif (pas de rm -rf, sudo, ni écriture hors projet).')}[/]"
+        )
 
     # ── First-run permission check ──
     cfg = _load_config()
@@ -2360,11 +4079,12 @@ def main(argv=None):
     log_file = os.path.join(CWD, ".localcoder.log")
     try:
         if os.path.exists(log_file) and os.path.getsize(log_file) > 1_000_000:
-            with open(log_file, 'r') as f:
+            with open(log_file, "r") as f:
                 lines = f.readlines()
-            with open(log_file, 'w') as f:
+            with open(log_file, "w") as f:
                 f.writelines(lines[-500:])
-    except: pass
+    except:
+        pass
     # Only log our stuff, not library noise
     logger = logging.getLogger("localcoder")
     logger.setLevel(logging.DEBUG)
@@ -2380,154 +4100,185 @@ def main(argv=None):
     system = {
         "role": "system",
         "content": f"You are Local Coder, an autonomous AI agent with coding AND computer use abilities. Working directory: {CWD}\n"
-                   f"Platform: macOS. Today is {time.strftime('%B %d, %Y')}.\n"
-                   f"ACT with tools. Never say 'I can\\'t'. Never give up.\n\n"
-                   f"TOOL SELECTION:\n"
-                   f"- CODING tasks (build apps, write code, edit files): use bash, write_file, read_file, edit_file\n"
-                   f"- WEB SEARCH (find info, images, docs, APIs): use web_search tool. This is the DEFAULT for 'search', 'find', 'look up'.\n"
-                   f"- BROWSE A SPECIFIC WEBSITE: use computer_use ONLY when user says 'on [website]', 'open [url]', 'browse [site]'.\n"
-                   f"  NOT a trigger: 'search for', 'find me', 'look up' — these use web_search.\n"
-                   f"  HOW: computer_use action:open:https://THE_URL_HERE (opens Chrome directly)\n"
-                   f"  After opening: take screenshot, read visible content, report to user.\n"
-                   f"  You CAN browse any website. Never say you cannot access a site.\n"
-                   f"- PDFs: use read_pdf tool\n"
-                   f"- Images: download with bash curl (auto-displays in terminal)\n\n"
-                   f"WHEN TO USE WHAT:\n"
-                   f"- Static page (fan page, portfolio, gallery, landing): just write ONE index.html file. No server needed.\n"
-                   f"- AI-powered app (analyzer, chatbot, scanner): use the 3-file pattern below (index.html + server.js + package.json).\n"
-                   f"- NEVER build an Express server for a simple static page.\n\n"
-                   f"APP SKILLS (pre-built templates you MUST use as baseline):\n"
-                   f"Skills directory: {os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.agents', 'skills'))}\n"
-                   f"When user asks to build an app, FIRST list ALL available skills and pick the closest:\n"
-                   f"  1. bash: ls {os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.agents', 'skills'))}\n"
-                   f"     (lists: quiz-game, flashcards, gallery, food-scanner, etc.)\n"
-                   f"  2. Pick the CLOSEST matching skill. 'math quiz' → quiz-game. 'vocabulary' → flashcards. 'fan page' → gallery.\n"
-                   f"  3. read_file the SKILL.md in that skill folder\n"
-                   f"  3. read_file the assets/index.html template\n"
-                   f"  4. write_file a customized copy to the user's project directory\n"
-                   f"  5. Test the result\n"
-                   f"NEVER generate complex HTML/SVG/CSS from scratch if a skill template exists.\n"
-                   f"Use web_search to find images for galleries/fan pages.\n\n"
-                   f"WEB APP ARCHITECTURE (ONLY for AI-powered apps that need a backend):\n\n"
-                   f"APP STRUCTURE: Always 3 files in the SAME directory:\n"
-                   f"  package.json, server.js, index.html (all inline CSS+JS)\n"
-                   f"  server.js must serve index.html with: app.get('/', (req,res) => res.sendFile(__dirname+'/index.html'));\n\n"
-                   f"SERVER.JS TEMPLATE (copy this pattern exactly):\n"
-                   f"  const express = require('express');\n"
-                   f"  const app = express();\n"
-                   f"  app.use(express.json({{limit:'50mb'}}));\n"
-                   f"  const API_BASE = process.env.LLM_API_BASE || 'http://127.0.0.1:8089/v1';\n"
-                   f"  const MODEL = process.env.LLM_MODEL || 'local';\n"
-                   f"  app.get('/', (req,res) => res.sendFile(__dirname+'/index.html'));\n"
-                   f"  app.post('/api/analyze', async (req,res) => {{\n"
-                   f"    const {{message, image}} = req.body;\n"
-                   f"    const userContent = image\n"
-                   f"      ? [{{type:'text',text:message}}, {{type:'image_url',image_url:{{url:image}}}}]\n"
-                   f"      : message;\n"
-                   f"    const r = await fetch(API_BASE+'/chat/completions', {{\n"
-                   f"      method:'POST', headers:{{'Content-Type':'application/json'}},\n"
-                   f"      body:JSON.stringify({{model:MODEL, stream:false, max_tokens:2048,\n"
-                   f"        messages:[{{role:'system',content:SYSTEM_PROMPT}}, {{role:'user',content:userContent}}]}}) }});\n"
-                   f"    const data = await r.json();\n"
-                   f"    res.json({{analysis: data.choices[0].message.content}}); }});\n"
-                   f"  app.listen(3000);\n\n"
-                   f"FRONTEND INDEX.HTML PATTERNS:\n"
-                   f"- DESIGN: Dark theme bg:#0a0a14. Card: background:rgba(255,255,255,0.04); backdrop-filter:blur(20px); border:1px solid rgba(255,255,255,0.08); border-radius:24px.\n"
-                   f"  Buttons: border-radius:14px; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; font-weight:600; padding:14px 28px.\n"
-                   f"  Title: font-size:2rem; font-weight:700; background:linear-gradient(to right,#f97316,#22c55e); -webkit-background-clip:text; color:transparent.\n"
-                   f"  Result area: background:rgba(255,255,255,0.03); border-left:3px solid #22c55e; border-radius:16px; padding:24px; white-space:pre-wrap.\n"
-                   f"  Use system-ui font. Add transition:all 0.2s on buttons. Loading: spinner animation.\n\n"
-                   f"- IMAGE UPLOAD (must use FileReader, never fake it):\n"
-                   f"  let imageBase64 = null;\n"
-                   f"  function uploadImage() {{\n"
-                   f"    const input = document.createElement('input');\n"
-                   f"    input.type='file'; input.accept='image/*';\n"
-                   f"    input.onchange = e => {{\n"
-                   f"      const file = e.target.files[0]; if(!file) return;\n"
-                   f"      const reader = new FileReader();\n"
-                   f"      reader.onload = ev => {{ imageBase64 = ev.target.result;\n"
-                   f"        document.getElementById('preview').src = imageBase64;\n"
-                   f"        document.getElementById('preview').style.display = 'block'; }};\n"
-                   f"      reader.readAsDataURL(file); }};\n"
-                   f"    input.click(); }}\n\n"
-                   f"- CAMERA CAPTURE (must use getUserMedia, never fake it):\n"
-                   f"  async function openCamera() {{\n"
-                   f"    const stream = await navigator.mediaDevices.getUserMedia({{video:{{facingMode:'environment'}}}});\n"
-                   f"    const video = document.getElementById('camVideo');\n"
-                   f"    video.srcObject = stream; video.style.display='block'; video.play();\n"
-                   f"    document.getElementById('captureBtn').style.display='inline-block'; }}\n"
-                   f"  function capturePhoto() {{\n"
-                   f"    const video = document.getElementById('camVideo');\n"
-                   f"    const canvas = document.createElement('canvas');\n"
-                   f"    canvas.width=video.videoWidth; canvas.height=video.videoHeight;\n"
-                   f"    canvas.getContext('2d').drawImage(video,0,0);\n"
-                   f"    imageBase64 = canvas.toDataURL('image/jpeg',0.8);\n"
-                   f"    document.getElementById('preview').src = imageBase64;\n"
-                   f"    document.getElementById('preview').style.display='block';\n"
-                   f"    video.srcObject.getTracks().forEach(t=>t.stop()); video.style.display='none'; }}\n\n"
-                   f"- SEND TO API (always this pattern):\n"
-                   f"  async function analyze() {{\n"
-                   f"    const msg = document.getElementById('input').value;\n"
-                   f"    if(!msg && !imageBase64) return;\n"
-                   f"    document.getElementById('result').innerHTML = '<div class=\"loading\">Analyzing...</div>';\n"
-                   f"    const res = await fetch('/api/analyze', {{\n"
-                   f"      method:'POST', headers:{{'Content-Type':'application/json'}},\n"
-                   f"      body:JSON.stringify({{message:msg||'Analyze this', image:imageBase64}}) }});\n"
-                   f"    const data = await res.json();\n"
-                   f"    document.getElementById('result').innerHTML = formatMarkdown(data.analysis);\n"
-                   f"    imageBase64 = null; }}\n\n"
-                   f"- MARKDOWN RENDERER:\n"
-                   f"  function formatMarkdown(text) {{\n"
-                   f"    return text.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>')\n"
-                   f"      .replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>')\n"
-                   f"      .replace(/^\\* (.+)$/gm,'<li>$1</li>').replace(/\\n/g,'<br>'); }}\n\n"
-                   f"- LOADING/SCANNING ANIMATION (always show while waiting for API):\n"
-                   f"  CSS: @keyframes scan {{ 0%{{transform:translateY(-100%)}} 100%{{transform:translateY(100%)}} }}\n"
-                   f"  .scanning {{ position:relative; overflow:hidden; }}\n"
-                   f"  .scanning::after {{ content:''; position:absolute; left:0; right:0; height:2px;\n"
-                   f"    background:linear-gradient(90deg,transparent,#22c55e,transparent); animation:scan 1.5s infinite; }}\n"
-                   f"  Also add a pulsing text: <div class='loading'>🔬 Scanning ingredients<span class='dots'></span></div>\n"
-                   f"  CSS: @keyframes dots {{ 0%{{content:''}} 33%{{content:'.'}} 66%{{content:'..'}} 100%{{content:'...'}} }}\n"
-                   f"  .dots::after {{ content:''; animation:dots 1.5s infinite steps(4); }}\n"
-                   f"  Show loading BEFORE fetch, hide AFTER response. Disable button during loading.\n\n"
-                   f"- NEVER fake FileReader/camera/API calls. ALWAYS use real implementations above.\n"
-                   f"- NEVER use SSE/streaming. Use stream:false and return full JSON.\n"
-                   f"- ALWAYS serve index.html from __dirname, NOT from a public/ subdirectory.\n"
-                   f"- ALWAYS test after building: npm install, node server.js &, curl POST to verify.\n\n"
-                   f"SELF-TESTING (MANDATORY for HTML/web apps):\n"
-                   f"After writing ANY index.html or web app, you MUST test it:\n"
-                   f"1. If static HTML: run 'bash: python3 -m http.server 8888 &' then 'bash: sleep 1 && curl -s http://localhost:8888/ | head -5' to verify it loads\n"
-                   f"2. If Express app: run 'bash: node server.js &' then 'bash: sleep 2 && curl -s http://localhost:3000/ | head -5'\n"
-                   f"3. Check for JS errors: run 'bash: node -e \"const fs=require(\\\"fs\\\"); const html=fs.readFileSync(\\\"index.html\\\",\\\"utf8\\\"); const scripts=html.match(/<script[^>]*>([\\\\s\\\\S]*?)<\\\\/script>/g); scripts?.forEach(s => {{ try {{ new Function(s.replace(/<\\\\/?script[^>]*>/g,\\\"\\\")); }} catch(e) {{ console.error(\\\"JS ERROR:\\\", e.message); }} }})\"'\n"
-                   f"4. If ANY test fails: read the error, fix the code, test again. DO NOT STOP until tests pass.\n"
-                   f"5. For interactive elements (buttons, forms): verify onclick/event handlers exist in the HTML.\n"
-                   f"6. For SVG: verify paths are valid (use M, L, A, Z commands with real coordinates, not placeholders).\n\n"
-                   f"BROWSER TESTING (use computer_use to test interactively):\n"
-                   f"- After building an HTML app, open it: computer_use action:open:file:///path/to/index.html\n"
-                   f"- Take screenshot to see the result\n"
-                   f"- Click buttons: computer_use action:click:x,y\n"
-                   f"- If something looks wrong, fix the code and re-test\n\n"
-                   f"COMMON BUGS TO AVOID:\n"
-                   f"- Start screen not hiding on button click: always add onclick='document.getElementById(\"screen1\").style.display=\"none\"; document.getElementById(\"screen2\").style.display=\"block\"'\n"
-                   f"- SVG pie/chart slices: use Math.cos(angle*Math.PI/180)*radius and Math.sin() for arc endpoints. Never approximate.\n"
-                   f"- Fetch to /api without server: static HTML files can't call /api. Use local JS logic or start Express.\n"
-                   f"- Missing CSS transitions: always add transition on hover/active states.\n\n"
-                   f"RULES:\n"
-                   f"- After reading a file ONCE, do NOT re-read it\n"
-                   f"- Write complete code with write_file, not code blocks in chat\n"
-                   f"- NEVER stop after writing files. Always test. Fix bugs. Test again.\n"
-                   f"- Be concise. Do NOT narrate your plan before acting. Just call the tool directly.\n"
-                   f"- Never say 'I will now...' or 'Let me...' — just do it."
+        f"Platform: macOS. Today is {time.strftime('%B %d, %Y')}.\n"
+        f"ACT with tools. Never say 'I can\\'t'. Never give up.\n\n"
+        f"TOOL SELECTION:\n"
+        f"- CODING tasks (build apps, write code, edit files): use bash, write_file, read_file, edit_file\n"
+        f"- WEB SEARCH (find info, images, docs, APIs): use web_search tool. This is the DEFAULT for 'search', 'find', 'look up'.\n"
+        f"- For photo/image requests: first prefer direct image search results and REAL photos. Avoid portraits/headshots unless the user explicitly asked for them. Avoid logos, illustrations, thumbnails, Pinterest pages, AI-generated images, wallpapers, and article URLs pretending to be images.\n"
+        f"- If search only finds article links, call fetch_url on the article to extract lead images via Jina Reader / og:image, then return the direct image URL.\n"
+        f"- If user asks to show an image, return at least one DIRECT image URL that can be downloaded and previewed inline (jpg/png/webp/gif). Avoid webpage/gallery/share URLs unless you clearly label them as fallback links.\n"
+        f"- If the user only wants a photo or image, do NOT inspect app skills and do NOT build a gallery or web page. Just search and return the best direct image URL.\n"
+        f"- BROWSE A SPECIFIC WEBSITE: use computer_use ONLY when user says 'on [website]', 'open [url]', 'browse [site]'.\n"
+        f"  NOT a trigger: 'search for', 'find me', 'look up' — these use web_search.\n"
+        f"  HOW: computer_use action:open:https://THE_URL_HERE (opens Chrome directly)\n"
+        f"  After opening: take screenshot, read visible content, report to user.\n"
+        f"  You CAN browse any website. Never say you cannot access a site.\n"
+        f"- PDFs: use read_pdf tool\n"
+        f"- Images: download with bash curl (auto-displays in terminal)\n\n"
+        f"WHEN TO USE WHAT:\n"
+        f"- Static page (fan page, portfolio, gallery, landing): just write ONE index.html file. No server needed.\n"
+        f"- AI-powered app (analyzer, chatbot, scanner): use the 3-file pattern below (index.html + server.js + package.json).\n"
+        f"- NEVER build an Express server for a simple static page.\n\n"
+        f"APP SKILLS (pre-built templates you MUST use as baseline):\n"
+        f"Skills directory: {os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.agents', 'skills'))}\n"
+        f"When user asks to build an app, FIRST list ALL available skills and pick the closest:\n"
+        f"  1. bash: ls {os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.agents', 'skills'))}\n"
+        f"     (lists: quiz-game, flashcards, gallery, food-scanner, etc.)\n"
+        f"  2. Pick the CLOSEST matching skill. 'math quiz' → quiz-game. 'vocabulary' → flashcards. 'fan page' → gallery.\n"
+        f"  3. read_file the SKILL.md in that skill folder\n"
+        f"  3. read_file the assets/index.html template\n"
+        f"  4. write_file a customized copy to the user's project directory\n"
+        f"  5. Test the result\n"
+        f"NEVER generate complex HTML/SVG/CSS from scratch if a skill template exists.\n"
+        f"Use web_search to find images for galleries/fan pages.\n\n"
+        f"WEB APP ARCHITECTURE (ONLY for AI-powered apps that need a backend):\n\n"
+        f"APP STRUCTURE: Always 3 files in the SAME directory:\n"
+        f"  package.json, server.js, index.html (all inline CSS+JS)\n"
+        f"  server.js must serve index.html with: app.get('/', (req,res) => res.sendFile(__dirname+'/index.html'));\n\n"
+        f"SERVER.JS TEMPLATE (copy this pattern exactly):\n"
+        f"  const express = require('express');\n"
+        f"  const app = express();\n"
+        f"  app.use(express.json({{limit:'50mb'}}));\n"
+        f"  const API_BASE = process.env.LLM_API_BASE || 'http://127.0.0.1:8089/v1';\n"
+        f"  const MODEL = process.env.LLM_MODEL || 'local';\n"
+        f"  app.get('/', (req,res) => res.sendFile(__dirname+'/index.html'));\n"
+        f"  app.post('/api/analyze', async (req,res) => {{\n"
+        f"    const {{message, image}} = req.body;\n"
+        f"    const userContent = image\n"
+        f"      ? [{{type:'text',text:message}}, {{type:'image_url',image_url:{{url:image}}}}]\n"
+        f"      : message;\n"
+        f"    const r = await fetch(API_BASE+'/chat/completions', {{\n"
+        f"      method:'POST', headers:{{'Content-Type':'application/json'}},\n"
+        f"      body:JSON.stringify({{model:MODEL, stream:false, max_tokens:2048,\n"
+        f"        messages:[{{role:'system',content:SYSTEM_PROMPT}}, {{role:'user',content:userContent}}]}}) }});\n"
+        f"    const data = await r.json();\n"
+        f"    res.json({{analysis: data.choices[0].message.content}}); }});\n"
+        f"  app.listen(3000);\n\n"
+        f"FRONTEND INDEX.HTML PATTERNS:\n"
+        f"- DESIGN: Dark theme bg:#0a0a14. Card: background:rgba(255,255,255,0.04); backdrop-filter:blur(20px); border:1px solid rgba(255,255,255,0.08); border-radius:24px.\n"
+        f"  Buttons: border-radius:14px; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; font-weight:600; padding:14px 28px.\n"
+        f"  Title: font-size:2rem; font-weight:700; background:linear-gradient(to right,#f97316,#22c55e); -webkit-background-clip:text; color:transparent.\n"
+        f"  Result area: background:rgba(255,255,255,0.03); border-left:3px solid #22c55e; border-radius:16px; padding:24px; white-space:pre-wrap.\n"
+        f"  Use system-ui font. Add transition:all 0.2s on buttons. Loading: spinner animation.\n\n"
+        f"- IMAGE UPLOAD (must use FileReader, never fake it):\n"
+        f"  let imageBase64 = null;\n"
+        f"  function uploadImage() {{\n"
+        f"    const input = document.createElement('input');\n"
+        f"    input.type='file'; input.accept='image/*';\n"
+        f"    input.onchange = e => {{\n"
+        f"      const file = e.target.files[0]; if(!file) return;\n"
+        f"      const reader = new FileReader();\n"
+        f"      reader.onload = ev => {{ imageBase64 = ev.target.result;\n"
+        f"        document.getElementById('preview').src = imageBase64;\n"
+        f"        document.getElementById('preview').style.display = 'block'; }};\n"
+        f"      reader.readAsDataURL(file); }};\n"
+        f"    input.click(); }}\n\n"
+        f"- CAMERA CAPTURE (must use getUserMedia, never fake it):\n"
+        f"  async function openCamera() {{\n"
+        f"    const stream = await navigator.mediaDevices.getUserMedia({{video:{{facingMode:'environment'}}}});\n"
+        f"    const video = document.getElementById('camVideo');\n"
+        f"    video.srcObject = stream; video.style.display='block'; video.play();\n"
+        f"    document.getElementById('captureBtn').style.display='inline-block'; }}\n"
+        f"  function capturePhoto() {{\n"
+        f"    const video = document.getElementById('camVideo');\n"
+        f"    const canvas = document.createElement('canvas');\n"
+        f"    canvas.width=video.videoWidth; canvas.height=video.videoHeight;\n"
+        f"    canvas.getContext('2d').drawImage(video,0,0);\n"
+        f"    imageBase64 = canvas.toDataURL('image/jpeg',0.8);\n"
+        f"    document.getElementById('preview').src = imageBase64;\n"
+        f"    document.getElementById('preview').style.display='block';\n"
+        f"    video.srcObject.getTracks().forEach(t=>t.stop()); video.style.display='none'; }}\n\n"
+        f"- SEND TO API (always this pattern):\n"
+        f"  async function analyze() {{\n"
+        f"    const msg = document.getElementById('input').value;\n"
+        f"    if(!msg && !imageBase64) return;\n"
+        f"    document.getElementById('result').innerHTML = '<div class=\"loading\">Analyzing...</div>';\n"
+        f"    const res = await fetch('/api/analyze', {{\n"
+        f"      method:'POST', headers:{{'Content-Type':'application/json'}},\n"
+        f"      body:JSON.stringify({{message:msg||'Analyze this', image:imageBase64}}) }});\n"
+        f"    const data = await res.json();\n"
+        f"    document.getElementById('result').innerHTML = formatMarkdown(data.analysis);\n"
+        f"    imageBase64 = null; }}\n\n"
+        f"- MARKDOWN RENDERER:\n"
+        f"  function formatMarkdown(text) {{\n"
+        f"    return text.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>')\n"
+        f"      .replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>')\n"
+        f"      .replace(/^\\* (.+)$/gm,'<li>$1</li>').replace(/\\n/g,'<br>'); }}\n\n"
+        f"- LOADING/SCANNING ANIMATION (always show while waiting for API):\n"
+        f"  CSS: @keyframes scan {{ 0%{{transform:translateY(-100%)}} 100%{{transform:translateY(100%)}} }}\n"
+        f"  .scanning {{ position:relative; overflow:hidden; }}\n"
+        f"  .scanning::after {{ content:''; position:absolute; left:0; right:0; height:2px;\n"
+        f"    background:linear-gradient(90deg,transparent,#22c55e,transparent); animation:scan 1.5s infinite; }}\n"
+        f"  Also add a pulsing text: <div class='loading'>🔬 Scanning ingredients<span class='dots'></span></div>\n"
+        f"  CSS: @keyframes dots {{ 0%{{content:''}} 33%{{content:'.'}} 66%{{content:'..'}} 100%{{content:'...'}} }}\n"
+        f"  .dots::after {{ content:''; animation:dots 1.5s infinite steps(4); }}\n"
+        f"  Show loading BEFORE fetch, hide AFTER response. Disable button during loading.\n\n"
+        f"- NEVER fake FileReader/camera/API calls. ALWAYS use real implementations above.\n"
+        f"- NEVER use SSE/streaming. Use stream:false and return full JSON.\n"
+        f"- ALWAYS serve index.html from __dirname, NOT from a public/ subdirectory.\n"
+        f"- ALWAYS test after building: npm install, node server.js &, curl POST to verify.\n\n"
+        f"SELF-TESTING (MANDATORY for HTML/web apps):\n"
+        f"After writing ANY index.html or web app, you MUST test it:\n"
+        f"1. If static HTML: run 'bash: python3 -m http.server 8888 &' then 'bash: sleep 1 && curl -s http://localhost:8888/ | head -5' to verify it loads\n"
+        f"2. If Express app: run 'bash: node server.js &' then 'bash: sleep 2 && curl -s http://localhost:3000/ | head -5'\n"
+        f'3. Check for JS errors: run \'bash: node -e "const fs=require(\\"fs\\"); const html=fs.readFileSync(\\"index.html\\",\\"utf8\\"); const scripts=html.match(/<script[^>]*>([\\\\s\\\\S]*?)<\\\\/script>/g); scripts?.forEach(s => {{ try {{ new Function(s.replace(/<\\\\/?script[^>]*>/g,\\"\\")); }} catch(e) {{ console.error(\\"JS ERROR:\\", e.message); }} }})"\'\n'
+        f"4. If ANY test fails: read the error, fix the code, test again. DO NOT STOP until tests pass.\n"
+        f"5. For interactive elements (buttons, forms): verify onclick/event handlers exist in the HTML.\n"
+        f"6. For SVG: verify paths are valid (use M, L, A, Z commands with real coordinates, not placeholders).\n\n"
+        f"BROWSER TESTING (use computer_use to test interactively):\n"
+        f"- After building an HTML app, open it: computer_use action:open:file:///path/to/index.html\n"
+        f"- Take screenshot to see the result\n"
+        f"- Click buttons: computer_use action:click:x,y\n"
+        f"- If something looks wrong, fix the code and re-test\n\n"
+        f"COMMON BUGS TO AVOID:\n"
+        f'- Start screen not hiding on button click: always add onclick=\'document.getElementById("screen1").style.display="none"; document.getElementById("screen2").style.display="block"\'\n'
+        f"- SVG pie/chart slices: use Math.cos(angle*Math.PI/180)*radius and Math.sin() for arc endpoints. Never approximate.\n"
+        f"- Fetch to /api without server: static HTML files can't call /api. Use local JS logic or start Express.\n"
+        f"- Missing CSS transitions: always add transition on hover/active states.\n\n"
+        f"RULES:\n"
+        f"- After reading a file ONCE, do NOT re-read it\n"
+        f"- Write complete code with write_file, not code blocks in chat\n"
+        f"- NEVER stop after writing files. Always test. Fix bugs. Test again.\n"
+        f"- Be concise. Do NOT narrate your plan before acting. Just call the tool directly.\n"
+        f"- Never say 'I will now...' or 'Let me...' — just do it.",
     }
+
+    # Add language instruction to system prompt for non-English UI
+    _lang_instr = _t("sys_lang_instruction")
+    if _lang_instr:
+        system["content"] = _lang_instr + "\n\n" + system["content"]
 
     # Auto-detect running model + load saved preference
     _load_last_model()
 
     show_banner()
 
+    # One-time iTerm2 Arabic setup hint
+    if UI_LANG == "ar":
+        _cfg_hint = _load_config()
+        if not _cfg_hint.get("iterm_rtl_hint_shown"):
+            tp = os.environ.get("TERM_PROGRAM", "").lower()
+            if tp.startswith("iterm"):
+                console.print()
+                console.print(
+                    Panel(
+                        "[bold]لأفضل عرض للعربية في iTerm2:[/]\n\n"
+                        "  [cyan]1.[/] Settings → General → Experimental → [bold]Enable RTL scripts[/]\n"
+                        "  [cyan]2.[/] Settings → Profiles → Text → Non-ASCII Font → [bold]Noto Sans Arabic[/]\n"
+                        "  [cyan]3.[/] Settings → Profiles → Text → Font Size → [bold]14+[/]",
+                        title="[bold #c084fc]إعداد الخط العربي[/]",
+                        border_style="#3f3f46",
+                        padding=(1, 2),
+                        width=min(75, console.width - 4),
+                    )
+                )
+                _save_config(iterm_rtl_hint_shown=True)
+
     # One-shot mode
     if args.prompt:
-        console.print(f"\n  [magenta]❯[/] [bold]{args.prompt}[/]")
+        console.print(_render_user_turn(args.prompt))
+        console.print()
         messages = [system, {"role": "user", "content": args.prompt}]
         agent_loop(messages, perms)
         return
@@ -2538,18 +4289,24 @@ def main(argv=None):
     console.print()
     shortcuts = Text()
     shortcuts.append("  ")
-    shortcuts.append(" ctrl+r ", style="bold white on #3d5a80")
-    shortcuts.append(" voice ", style="dim")
-    shortcuts.append(" ctrl+v ", style="bold white on #3d5a80")
-    shortcuts.append(" image ", style="dim")
-    shortcuts.append(" /gpu ", style="bold white on #555555")
-    shortcuts.append(" stats ", style="dim")
-    shortcuts.append(" /clean ", style="bold white on #555555")
-    shortcuts.append(" free ", style="dim")
-    shortcuts.append(" /think ", style="bold white on #555555")
-    shortcuts.append(" reason ", style="dim")
-    shortcuts.append(" /models ", style="bold white on #555555")
-    shortcuts.append(" switch ", style="dim")
+    # Build shortcut pairs: (key, key_style, label, label_style)
+    _shortcut_pairs = [
+        (" ctrl+r ", "bold white on #3d5a80", f" {_t('voice') or 'voice'} ", "dim"),
+        (
+            " Enter ",
+            "bold white on #6b21a8",
+            f" {_t('stop_send') or 'stop + send'} ",
+            "dim",
+        ),
+        (" ctrl+v ", "bold white on #3d5a80", f" {_t('image') or 'image'} ", "dim"),
+        (" /gpu ", "bold white on #555555", f" {_t('stats') or 'stats'} ", "dim"),
+        (" /clean ", "bold white on #555555", f" {_t('free') or 'free'} ", "dim"),
+        (" /think ", "bold white on #555555", f" {_t('reason') or 'reason'} ", "dim"),
+        (" /models ", "bold white on #555555", f" {_t('switch') or 'switch'} ", "dim"),
+    ]
+    for key, key_style, label, label_style in _shortcut_pairs:
+        shortcuts.append(key, style=key_style)
+        shortcuts.append(label, style=label_style)
     console.print(shortcuts)
     console.print()
 
@@ -2561,10 +4318,16 @@ def main(argv=None):
         try:
             with open(history_file) as f:
                 messages = json.load(f)
-            n = len([m for m in messages if isinstance(m, dict) and m.get("role") == "user"])
-            console.print(f"  [green]✦ Resumed session ({n} messages)[/]")
+            n = len(
+                [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+            )
+            console.print(
+                f"  [green]{_ui(f'✦ Resumed session ({n} messages)', f'✦ استئناف الجلسة ({n} رسائل)', f'✦ Session restaurée ({n} messages)')}[/]"
+            )
         except:
-            console.print(f"  [dim]No saved session — starting fresh[/]")
+            console.print(
+                f"  [dim]{_ui('No saved session — starting fresh', 'لا توجد جلسة محفوظة — بداية جديدة', 'Pas de session sauvegardée — nouveau départ')}[/]"
+            )
             messages = [system]
     else:
         messages = [system]
@@ -2572,32 +4335,45 @@ def main(argv=None):
     # Clipboard image state + voice state
     _clipboard_image_path = [None]
     _voice_proc = [None]  # active recording process
-    _voice_wav = [None]   # wav file path
+    _voice_wav = [None]  # wav file path
 
     # Voice input setup
     _voice_available = False
     _voice_lang = "auto"
     try:
         import shutil as _shutil
-        _whisper_bin = _shutil.which("whisper-cli")
-        _whisper_model = os.path.expanduser("~/.local/share/whisper/ggml-small.bin")
-        if not os.path.exists(_whisper_model):
-            _whisper_model = os.path.expanduser("~/.local/share/whisper/ggml-base.bin")
-        _sox_rec = _shutil.which("rec")
-        _voice_available = bool(_whisper_bin and os.path.exists(_whisper_model) and _sox_rec)
 
-        # Load language preference
+        _whisper_bin = _shutil.which("whisper-cli")
+        _sox_rec = _shutil.which("rec")
+
+        # Load language preference — match UI language if not explicitly set
         _cfg = _load_config()
         _voice_lang = _cfg.get("voice_language", "auto")
+        # When using Arabic/French UI, always match voice language
+        if UI_LANG in ("ar", "fr"):
+            _voice_lang = UI_LANG
+        _whisper_model = _resolve_whisper_model(_voice_lang, _cfg)
+        _voice_available = bool(
+            _whisper_bin and os.path.exists(_whisper_model) and _sox_rec
+        )
 
         # First-time voice setup — ask language
-        if _voice_available and _voice_lang == "auto" and not _cfg.get("voice_setup_done"):
+        if (
+            _voice_available
+            and _voice_lang == "auto"
+            and not _cfg.get("voice_setup_done")
+        ):
             console.print()
-            console.print(Panel(
-                "[bold]Voice Input Setup[/]  [dim]one-time configuration[/]",
-                border_style="#81b29a", padding=(0, 1),
-            ))
-            console.print(f"  [dim]Select your primary speaking language for voice input:[/]\n")
+            console.print(
+                Panel(
+                    "[bold]Voice Input Setup[/]  [dim]one-time configuration[/]",
+                    border_style="#81b29a",
+                    padding=(0, 1),
+                )
+            )
+            console.print(
+                f"  [dim]Select your primary speaking language for voice input:[/]\n"
+            )
             LANGS = [
                 ("en", "English"),
                 ("fr", "French"),
@@ -2609,7 +4385,7 @@ def main(argv=None):
                 ("auto", "Auto-detect (less accurate on short phrases)"),
             ]
             for i, (code, name) in enumerate(LANGS):
-                console.print(f"    [bold]{i+1}.[/] {name} [dim]({code})[/]")
+                console.print(f"    [bold]{i + 1}.[/] {name} [dim]({code})[/]")
             console.print()
             try:
                 ans = input("  ▸ ").strip()
@@ -2625,20 +4401,79 @@ def main(argv=None):
             console.print(f"  [dim]Change anytime with /voice-lang[/]\n")
 
         if _voice_available:
-            logger.info(f"Voice input available (whisper-cli + rec, lang={_voice_lang})")
+            logger.info(
+                f"Voice input available (whisper-cli + rec, lang={_voice_lang}, model={_whisper_model})"
+            )
     except:
         pass
+
+    # Voice animation state
+    _voice_anim_stop = [None]  # threading.Event when animation is running
+    _ctrl_c_armed_at = [0.0]
+
+    def _voice_animation_thread(stop_event):
+        """Background thread: animated waveform bars while recording."""
+        bars = "▁▂▃▄▅▆▇█"
+        # Gradient: cyan → green → magenta → blue
+        colors = [
+            "\033[36m",
+            "\033[32m",
+            "\033[35m",
+            "\033[34m",
+            "\033[36m",
+            "\033[32m",
+            "\033[35m",
+            "\033[34m",
+        ]
+        label = _t("recording") or "Recording..."
+        stop_hint = _t("press_ctrlr_stop") or "Ctrl+R to stop"
+        start_t = time.time()
+        fd = None
+        try:
+            fd = os.open("/dev/tty", os.O_WRONLY)
+            os.write(fd, b"\n")
+            n_bars = 24
+            while not stop_event.is_set():
+                elapsed = int(time.time() - start_t)
+                mins, secs = divmod(elapsed, 60)
+                time_str = f"{mins:01d}:{secs:02d}"
+                # Generate waveform with smooth random levels
+                wave = ""
+                for i in range(n_bars):
+                    ci = i % len(colors)
+                    level = random.randint(0, len(bars) - 1)
+                    wave += f"{colors[ci]}{bars[level]}\033[0m"
+                line = f"\r  \033[1;35m●\033[0m \033[35m{label}\033[0m  {wave}  \033[2;33m{time_str}\033[0m  \033[2m{stop_hint}\033[0m\033[K"
+                os.write(fd, line.encode())
+                stop_event.wait(0.12)
+        except Exception:
+            pass
+        finally:
+            if fd is not None:
+                try:
+                    os.write(fd, b"\r\033[K")  # clear animation line
+                    os.close(fd)
+                except Exception:
+                    pass
 
     # Key bindings
     kb = KeyBindings()
 
-    @kb.add('c-r')
+    @kb.add("c-r")
     def _voice_toggle(event):
         """Ctrl+R: toggle voice — start recording or stop+transcribe."""
         if not _voice_available:
             try:
                 fd = os.open("/dev/tty", os.O_WRONLY)
-                os.write(fd, b"\n  \033[33mVoice not available. Run: localcoder --setup\033[0m\n")
+                os.write(
+                    fd,
+                    b"\n  \033[33m"
+                    + (
+                        _t("voice_not_avail")
+                        or "Voice not available. Run: localcoder --setup"
+                    ).encode()
+                    + b"\033[0m\n",
+                )
                 os.close(fd)
             except:
                 pass
@@ -2651,16 +4486,39 @@ def main(argv=None):
 
         # START RECORDING
         try:
-            fd = os.open("/dev/tty", os.O_WRONLY)
             _voice_wav[0] = os.path.join(CWD, ".localcoder-voice.wav")
             _voice_proc[0] = subprocess.Popen(
-                [_sox_rec, "-q", "-r", "16000", "-c", "1", "-b", "16", _voice_wav[0], "trim", "0", "30"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                [
+                    _sox_rec,
+                    "-q",
+                    "-r",
+                    "16000",
+                    "-c",
+                    "1",
+                    "-b",
+                    "16",
+                    _voice_wav[0],
+                    "trim",
+                    "0",
+                    "30",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-            os.write(fd, b"\n  \033[1;35m\xe2\x97\x8f\033[0m \033[35mRecording...\033[0m \033[2mpress Ctrl+R to stop\033[0m\n")
-            os.close(fd)
+            # Start waveform animation
+            _voice_anim_stop[0] = threading.Event()
+            anim = threading.Thread(
+                target=_voice_animation_thread,
+                args=(_voice_anim_stop[0],),
+                daemon=True,
+            )
+            anim.start()
         except Exception as e:
             _voice_proc[0] = None
+            if _voice_anim_stop[0]:
+                _voice_anim_stop[0].set()
+                _voice_anim_stop[0] = None
             try:
                 fd = os.open("/dev/tty", os.O_WRONLY)
                 os.write(fd, f"\n  \033[31mRecord error: {e}\033[0m\n".encode())
@@ -2668,10 +4526,38 @@ def main(argv=None):
             except:
                 pass
 
+    @kb.add("c-c")
+    def _ctrl_c_clear_or_quit(event):
+        """Ctrl+C once clears input, Ctrl+C twice on empty input quits."""
+        buf = event.app.current_buffer
+        if buf.text:
+            buf.set_document(Document("", 0), bypass_readonly=True)
+            _ctrl_c_armed_at[0] = 0.0
+            return
+
+        now = time.time()
+        if now - _ctrl_c_armed_at[0] < 1.5:
+            event.app.exit(exception=KeyboardInterrupt, style="")
+            return
+
+        _ctrl_c_armed_at[0] = now
+        try:
+            fd = os.open("/dev/tty", os.O_WRONLY)
+            os.write(fd, b"\r\033[K  \033[2mCtrl+C again to quit\033[0m\n")
+            os.close(fd)
+        except Exception:
+            pass
+
     def _do_voice_transcribe(event):
         """Stop recording and transcribe."""
         if _voice_proc[0] is None:
             return
+
+        # Stop animation first
+        if _voice_anim_stop[0]:
+            _voice_anim_stop[0].set()
+            _voice_anim_stop[0] = None
+            time.sleep(0.15)  # let animation thread clean up
 
         try:
             fd = os.open("/dev/tty", os.O_WRONLY)
@@ -2684,14 +4570,42 @@ def main(argv=None):
                 _voice_proc[0].kill()
             _voice_proc[0] = None
 
-            os.write(fd, b"  \033[2mTranscribing...\033[0m\n")
+            os.write(
+                fd,
+                b"  \033[2m"
+                + (_t("transcribing") or "Transcribing...").encode()
+                + b"\033[0m\n",
+            )
 
             # Transcribe with whisper (Metal GPU — only ~200MB, fits in headroom)
+            # For Arabic: use beam-size 5 for much better accuracy
+            whisper_cmd = [
+                _whisper_bin,
+                "--model",
+                _whisper_model,
+                "--language",
+                _voice_lang,
+                "--no-timestamps",
+                "--threads",
+                "8",
+                "--file",
+                _voice_wav[0],
+            ]
+            # Stronger decoding improves Arabic/non-English recognition.
+            if _voice_lang in ("ar", "fr", "es", "de", "ja", "zh"):
+                whisper_cmd.extend(["--beam-size", "8", "--best-of", "8", "--temperature", "0", "--no-fallback"])
+            if _voice_lang == "ar":
+                whisper_cmd.extend(
+                    [
+                        "--prompt",
+                        "نص عربي واضح باللغة العربية الفصحى مع أسماء الأماكن والكلمات الدينية بشكل صحيح.",
+                    ]
+                )
             result = subprocess.run(
-                [_whisper_bin, "--model", _whisper_model,
-                 "--language", _voice_lang, "--no-timestamps", "--threads", "8",
-                 "--file", _voice_wav[0]],
-                capture_output=True, text=True, timeout=30
+                whisper_cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
 
             # Parse detected language
@@ -2704,17 +4618,41 @@ def main(argv=None):
             lines = []
             for line in result.stdout.split("\n"):
                 line = line.strip()
-                if line and not line.startswith("[") and not line.startswith("whisper_"):
+                if (
+                    line
+                    and not line.startswith("[")
+                    and not line.startswith("whisper_")
+                ):
                     lines.append(line)
             text = " ".join(lines).strip()
             text = text.replace("(silence)", "").replace("[BLANK_AUDIO]", "").strip()
+            # Filter common whisper hallucinations for non-English
+            for hallucination in [
+                "(speaking in foreign language)",
+                "(Speaking in foreign language)",
+                "(speaks in foreign language)",
+                "(foreign language)",
+                "(musique)",
+                "(music)",
+                "[Music]",
+                "(Musique)",
+            ]:
+                text = text.replace(hallucination, "").strip()
 
             if text:
                 lang_tag = f" [{lang}]" if lang else ""
-                os.write(fd, f"  \033[32m✓\033[0m \033[2m{text[:80]}{lang_tag}\033[0m\n".encode())
+                os.write(
+                    fd,
+                    f"  \033[32m✓\033[0m \033[2m{text[:80]}{lang_tag}\033[0m\n".encode(),
+                )
                 event.app.current_buffer.insert_text(text)
             else:
-                os.write(fd, b"  \033[2mNo speech detected\033[0m\n")
+                os.write(
+                    fd,
+                    b"  \033[2m"
+                    + (_t("no_speech") or "No speech detected").encode()
+                    + b"\033[0m\n",
+                )
 
             os.close(fd)
 
@@ -2730,7 +4668,7 @@ def main(argv=None):
             except:
                 pass
 
-    @kb.add('c-v')
+    @kb.add("c-v")
     def _paste_image(event):
         """Ctrl+V: check clipboard for image, show preview immediately."""
         img = get_clipboard_image()
@@ -2745,8 +4683,9 @@ def main(argv=None):
                     tty_fd = os.open("/dev/tty", os.O_WRONLY)
                     os.write(tty_fd, b"\n")
                     spawnSync = subprocess.Popen(
-                        [timg, "-g", "40x12", "-p", "i", img],
-                        stdout=tty_fd, stderr=tty_fd
+                        [timg, "-g", "40x12", "-C", "-p", "i", img],
+                        stdout=tty_fd,
+                        stderr=tty_fd,
                     )
                     spawnSync.wait(timeout=5)
                     sz = os.path.getsize(img) // 1024
@@ -2757,7 +4696,9 @@ def main(argv=None):
         else:
             # Normal paste — insert text from clipboard
             try:
-                txt = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=2).stdout
+                txt = subprocess.run(
+                    ["pbpaste"], capture_output=True, text=True, timeout=2
+                ).stdout
                 if txt:
                     event.app.current_buffer.insert_text(txt)
             except:
@@ -2766,6 +4707,7 @@ def main(argv=None):
     # Slash command autocomplete
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.formatted_text import HTML as PT_HTML_CMD
+
     SLASH_COMMANDS = {
         "/models": "Switch model (fuzzy search)",
         "/model": "Set model by name",
@@ -2797,9 +4739,15 @@ def main(argv=None):
                 for cmd, desc in SLASH_COMMANDS.items():
                     if text.lower() in cmd.lower() or cmd.startswith(text):
                         # Escape XML-invalid chars in description
-                        safe_desc = desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        safe_desc = (
+                            desc.replace("&", "&amp;")
+                            .replace("<", "&lt;")
+                            .replace(">", "&gt;")
+                        )
                         try:
-                            display = PT_HTML_CMD(f'<b>{cmd}</b> <style fg="ansigray">{safe_desc}</style>')
+                            display = PT_HTML_CMD(
+                                f'<b>{cmd}</b> <style fg="ansigray">{safe_desc}</style>'
+                            )
                         except Exception:
                             display = f"{cmd} {desc}"
                         yield Completion(
@@ -2808,21 +4756,60 @@ def main(argv=None):
                             display=display,
                         )
 
+    from prompt_toolkit.styles import Style as PTStyle
+
+    _prompt_style = PTStyle.from_dict(
+        {
+            "": "#e5e7eb",
+            "prompt.label": "bold #c084fc",
+            "frame.border": "#3f3f46",
+            "bottom-toolbar": "bg:#0f172a #cbd5e1",
+            "rprompt": "#94a3b8",
+            "completion-menu": "bg:#111827 #e5e7eb",
+            "completion-menu.completion.current": "bg:#1f2937 #ffffff",
+        }
+    )
+
+    def _get_rprompt():
+        """Right-side prompt hints — localized."""
+        if UI_LANG == "ar":
+            # Mixed RTL/LTR hints render poorly in many terminals. Keep this compact.
+            return ""
+        return _ui(
+            "Enter to send  ·  /think for reasoning  ·  ? for help",
+            None,
+            "Entrée pour envoyer  ·  /think pour réfléchir  ·  ? pour aide",
+        )
+
+    if UI_LANG == "ar":
+        _prompt_label = f"{_display_text('رسالة')} ▸ "
+    else:
+        _prompt_label = _ui("❯ ", None, "message ▸ ")
+
     session = PromptSession(
         history=FileHistory(os.path.join(CWD, ".localcoder-input-history")),
         bottom_toolbar=get_toolbar,
         key_bindings=kb,
         completer=SlashCompleter(),
         complete_while_typing=True,
+        style=_prompt_style,
+        reserve_space_for_menu=0,
+        erase_when_done=True,
+        refresh_interval=0.08,
     )
 
     while True:
         _clipboard_image_path[0] = None
         try:
-            console.print(Rule(style="dim"))
-            task = session.prompt(HTML('<style fg="ansimagenta" bg="" bold="true">❯ </style>')).strip()
+            task = session.prompt(
+                HTML(
+                    f'<style fg="ansimagenta" bg="" bold="true">{_prompt_label}</style>'
+                ),
+                rprompt=_get_rprompt,
+                show_frame=True,
+            ).strip()
         except KeyboardInterrupt:
-            console.print(f"\n  [dim]bye[/]")
+            console.print(f"\n  [dim]{_t('bye') or 'bye'}[/]")
             break
         except EOFError:
             break
@@ -2831,23 +4818,29 @@ def main(argv=None):
             continue
 
         if task == "/clear":
-            messages = [system]; total_tokens = 0
+            messages = [system]
+            total_tokens = 0
             console.clear()
             show_banner()
             bi = BACKEND_INFO
             ml = f"Gemma 4 {bi['size']}" if bi["size"] else MODEL
             qt = f" {bi['quant']}" if bi["quant"] else ""
-            console.print(f"\n  [dim]model[/] [bold cyan]{ml}{qt}[/]  [dim]backend[/] [bold green]{bi['backend']}[/]  [dim]ctx[/] [bold green]{bi['ctx'] or '?'}[/]  [dim]perms[/] [bold yellow]{perms.mode}[/]")
-            console.print(f"  [green]Conversation cleared.[/]\n"); continue
+            console.print(
+                f"\n  [dim]model[/] [bold cyan]{ml}{qt}[/]  [dim]backend[/] [bold green]{bi['backend']}[/]  [dim]ctx[/] [bold green]{bi['ctx'] or '?'}[/]  [dim]perms[/] [bold yellow]{perms.mode}[/]"
+            )
+            console.print(f"  [green]Conversation cleared.[/]\n")
+            continue
         if task == "/cost":
-            console.print(f"  [green]$0.00 — {total_tokens} tokens[/]"); continue
+            console.print(f"  [green]$0.00 — {total_tokens} tokens[/]")
+            continue
         if task.startswith("/think"):
             global REASONING_EFFORT
             import tty, termios
+
             levels = ["none", "low", "medium", "high"]
-            icons  = ["⚡", "💭", "🧠", "🔬"]
-            tags   = ["off", "light", "think", "deep"]
-            descs  = ["No thinking", "Quick reasoning", "Balanced", "Deep reasoning"]
+            icons = ["⚡", "💭", "🧠", "🔬"]
+            tags = ["off", "light", "think", "deep"]
+            descs = ["No thinking", "Quick reasoning", "Balanced", "Deep reasoning"]
             idx = levels.index(REASONING_EFFORT) if REASONING_EFFORT in levels else 2
 
             # ANSI colors
@@ -2874,15 +4867,15 @@ def main(argv=None):
                 tty.setraw(fd)
                 while True:
                     ch = sys.stdin.read(1)
-                    if ch == '\r' or ch == '\n':
+                    if ch == "\r" or ch == "\n":
                         break
-                    if ch == '\x1b':
+                    if ch == "\x1b":
                         seq = sys.stdin.read(2)
-                        if seq == '[D':  # left
+                        if seq == "[D":  # left
                             idx = max(0, idx - 1)
-                        elif seq == '[C':  # right
+                        elif seq == "[C":  # right
                             idx = min(len(levels) - 1, idx + 1)
-                    elif ch == 'q' or ch == '\x03':
+                    elif ch == "q" or ch == "\x03":
                         break
                     _draw(idx)
             finally:
@@ -2890,7 +4883,9 @@ def main(argv=None):
 
             REASONING_EFFORT = levels[idx]
             sys.stdout.write(f"\r\033[K")
-            console.print(f"  {icons[idx]} Reasoning: [bold]{REASONING_EFFORT}[/] — {descs[idx]}")
+            console.print(
+                f"  {icons[idx]} Reasoning: [bold]{REASONING_EFFORT}[/] — {descs[idx]}"
+            )
             continue
         if task == "/context":
             ctx_used = estimate_tokens(json.dumps(messages))
@@ -2899,14 +4894,21 @@ def main(argv=None):
                 ctx_max = int(ctx_str.replace("K", "")) * 1024
                 context_usage_bar(console, ctx_used, ctx_max)
             else:
-                console.print(f"  [cyan]~{ctx_used} tokens / ? ({len(messages)} msgs)[/]")
+                console.print(
+                    f"  [cyan]~{ctx_used} tokens / ? ({len(messages)} msgs)[/]"
+                )
             continue
         if task == "/gpu":
             try:
                 from localcoder.backends import (
-                    get_machine_specs, get_metal_gpu_stats, get_swap_usage_mb,
-                    get_llama_server_config, _detect_model_info, get_top_memory_processes,
+                    get_machine_specs,
+                    get_metal_gpu_stats,
+                    get_swap_usage_mb,
+                    get_llama_server_config,
+                    _detect_model_info,
+                    get_top_memory_processes,
                 )
+
                 specs = get_machine_specs()
                 metal = get_metal_gpu_stats()
                 swap = get_swap_usage_mb()
@@ -2933,19 +4935,29 @@ def main(argv=None):
                 bc = "green" if pct < 0.75 else "yellow" if pct < 0.9 else "red"
                 bar = f"[{bc}]{'━' * filled}[/{bc}][dim]{'─' * (bar_w - filled)}[/]"
 
-                console.print(f"\n  [bold]GPU[/]  {bar}  [{gc}]{model_mb // 1024}/{gt // 1024}GB[/{gc}]  free: {gf // 1024}GB")
-                console.print(f"  [bold]Swap[/] [{sc}]{swap // 1024}GB[/{sc}]  [bold]Pressure[/] {specs.get('mem_pressure', '?')}")
+                console.print(
+                    f"\n  [bold]GPU[/]  {bar}  [{gc}]{model_mb // 1024}/{gt // 1024}GB[/{gc}]  free: {gf // 1024}GB"
+                )
+                console.print(
+                    f"  [bold]Swap[/] [{sc}]{swap // 1024}GB[/{sc}]  [bold]Pressure[/] {specs.get('mem_pressure', '?')}"
+                )
 
                 if srv.get("running"):
                     mi = _detect_model_info(srv, None)
                     ms = mi["name"] or "?"
-                    if mi["quant"]: ms += f" {mi['quant']}"
+                    if mi["quant"]:
+                        ms += f" {mi['quant']}"
                     gi = "[green]GPU[/]" if srv["ngl"] >= 90 else "[red]CPU[/]"
-                    console.print(f"  [bold]Model[/] [cyan]{ms}[/]  {gi}  ctx {srv['n_ctx'] // 1024}K  footprint {srv.get('footprint_mb', 0)}MB")
+                    console.print(
+                        f"  [bold]Model[/] [cyan]{ms}[/]  {gi}  ctx {srv['n_ctx'] // 1024}K  footprint {srv.get('footprint_mb', 0)}MB"
+                    )
 
                 app_procs = [p for p in procs if p["category"] == "app"]
                 if app_procs:
-                    hogs = "  ".join(f"{p['name']}{'×'+str(p['count']) if p.get('count',1)>1 else ''} {p['mb']//1024}G" for p in app_procs[:4])
+                    hogs = "  ".join(
+                        f"{p['name']}{'×' + str(p['count']) if p.get('count', 1) > 1 else ''} {p['mb'] // 1024}G"
+                        for p in app_procs[:4]
+                    )
                     console.print(f"  [bold]Apps[/]  {hogs}")
                 console.print()
             except ImportError:
@@ -2954,24 +4966,33 @@ def main(argv=None):
         if task == "/clean":
             try:
                 from localcoder.backends import (
-                    cleanup_gpu_memory, get_metal_gpu_stats, get_swap_usage_mb,
+                    cleanup_gpu_memory,
+                    get_metal_gpu_stats,
+                    get_swap_usage_mb,
                     get_top_memory_processes,
                 )
+
                 # Before
                 metal_before = get_metal_gpu_stats()
                 swap_before = get_swap_usage_mb()
                 ga_before = metal_before.get("alloc_mb", 0)
 
-                console.print(f"\n  [yellow]Freeing GPU memory...[/]  [dim](safe — won't close your apps)[/]")
+                console.print(
+                    f"\n  [yellow]Freeing GPU memory...[/]  [dim](safe — won't close your apps)[/]"
+                )
                 result = cleanup_gpu_memory(force=False)
 
                 if result["ollama_unloaded"]:
-                    console.print(f"  [green]✓[/] Unloaded: {', '.join(result['ollama_unloaded'])}")
+                    console.print(
+                        f"  [green]✓[/] Unloaded: {', '.join(result['ollama_unloaded'])}"
+                    )
                 else:
                     console.print(f"  [dim]No idle models to unload.[/]")
 
                 # After
-                import time as _tc; _tc.sleep(1)
+                import time as _tc
+
+                _tc.sleep(1)
                 metal_after = get_metal_gpu_stats()
                 swap_after = get_swap_usage_mb()
                 ga_after = metal_after.get("alloc_mb", 0)
@@ -2979,12 +5000,16 @@ def main(argv=None):
                 freed = max(0, ga_before - ga_after)
 
                 gc = "green" if ga_after < gt else "red"
-                console.print(f"  [bold]Before[/] {ga_before // 1024}GB  [bold]After[/] [{gc}]{ga_after // 1024}GB[/{gc}]  [bold]Freed[/] {freed // 1024}GB  [bold]Swap[/] {swap_after // 1024}GB")
+                console.print(
+                    f"  [bold]Before[/] {ga_before // 1024}GB  [bold]After[/] [{gc}]{ga_after // 1024}GB[/{gc}]  [bold]Freed[/] {freed // 1024}GB  [bold]Swap[/] {swap_after // 1024}GB"
+                )
 
                 app_procs = get_top_memory_processes(min_mb=500, limit=3)
                 apps = [p for p in app_procs if p["category"] == "app"]
                 if apps and ga_after > gt:
-                    console.print(f"  [dim]Still overloaded. Close these for more: {', '.join(p['name'] for p in apps[:3])}[/]")
+                    console.print(
+                        f"  [dim]Still overloaded. Close these for more: {', '.join(p['name'] for p in apps[:3])}[/]"
+                    )
                 console.print()
             except ImportError:
                 console.print("  [dim]Install localcoder package for cleanup[/]")
@@ -2992,40 +5017,70 @@ def main(argv=None):
         if task == "/health":
             try:
                 from localcoder.backends import print_health_dashboard
+
                 print_health_dashboard()
             except ImportError:
-                console.print("  [dim]Install localcoder package for health dashboard[/]")
+                console.print(
+                    "  [dim]Install localcoder package for health dashboard[/]"
+                )
             continue
         if task == "/resume":
             try:
-                with open(history_file) as f: messages = json.load(f)
+                with open(history_file) as f:
+                    messages = json.load(f)
                 console.print(f"  [green]Resumed {len(messages)} messages[/]")
-            except: console.print("  [dim]No saved session[/]")
+            except:
+                console.print("  [dim]No saved session[/]")
             continue
         if task in ("/ask", "/auto", "/bypass", "/yolo"):
             perms.mode = "bypass" if task == "/yolo" else task[1:]
-            console.print(f"  [yellow]Permissions: {perms.mode}[/]"); continue
+            console.print(f"  [yellow]Permissions: {perms.mode}[/]")
+            continue
         if task == "/undo" or task.startswith("/undo "):
             parts = task.split(None, 1)
             path = parts[1] if len(parts) > 1 else None
             msg = restore_snapshot(0, path)
-            console.print(f"  [green]{msg}[/]"); continue
+            console.print(f"  [green]{msg}[/]")
+            continue
         if task == "/snapshots" or task.startswith("/snapshots "):
             parts = task.split(None, 1)
             path = parts[1] if len(parts) > 1 else None
-            console.print(list_snapshots(path)); continue
+            console.print(list_snapshots(path))
+            continue
         if task.startswith("/diff "):
             path = task.split(None, 1)[1]
             full = os.path.join(CWD, path)
             if os.path.isfile(full):
                 # Diff current vs latest snapshot
-                snaps = sorted([s for s in os.listdir(SNAPSHOT_DIR) if path.replace("/","__") in s], reverse=True) if os.path.isdir(SNAPSHOT_DIR) else []
+                snaps = (
+                    sorted(
+                        [
+                            s
+                            for s in os.listdir(SNAPSHOT_DIR)
+                            if path.replace("/", "__") in s
+                        ],
+                        reverse=True,
+                    )
+                    if os.path.isdir(SNAPSHOT_DIR)
+                    else []
+                )
                 if snaps:
                     snap_path = os.path.join(SNAPSHOT_DIR, snaps[0])
                     try:
-                        r = subprocess.run(["diff", "--color=always", "-u", snap_path, full], capture_output=True, text=True, timeout=5)
+                        r = subprocess.run(
+                            ["diff", "--color=always", "-u", snap_path, full],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
                         if r.stdout:
-                            console.print(Panel(r.stdout[:3000], title=f"[bold]diff {path}[/]", border_style="yellow"))
+                            console.print(
+                                Panel(
+                                    r.stdout[:3000],
+                                    title=f"[bold]diff {path}[/]",
+                                    border_style="yellow",
+                                )
+                            )
                         else:
                             console.print(f"  [dim]No changes since last snapshot[/]")
                     except:
@@ -3047,7 +5102,8 @@ def main(argv=None):
             matched = None
             for m in all_m:
                 if name.lower() in m["id"].lower():
-                    matched = m; break
+                    matched = m
+                    break
             if matched:
                 _switch_model(matched["id"], matched["url"])
             else:
@@ -3057,20 +5113,39 @@ def main(argv=None):
             img = get_clipboard_image()
             if img:
                 show_image_inline(img)
-                console.print(f"  [green]Clipboard image saved. Ask a question about it.[/]")
+                console.print(
+                    f"  [green]Clipboard image saved. Ask a question about it.[/]"
+                )
                 # Add as next user message with image reference
-                task = input("  [dim]Question about image:[/] ").strip() or "What is in this image?"
+                task = (
+                    input("  [dim]Question about image:[/] ").strip()
+                    or "What is in this image?"
+                )
                 import base64 as b64mod
+
                 img_b64 = b64mod.b64encode(open(img, "rb").read()).decode()
-                messages.append({"role": "user", "content": [
-                    {"type": "text", "text": task},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-                ]})
-                console.print(f"\n  [magenta]❯[/] [bold]{task}[/] [dim](+ clipboard image)[/]")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": task},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_b64}"
+                                },
+                            },
+                        ],
+                    }
+                )
+                console.print(_render_user_turn(task, note="attached clipboard image"))
+                console.print()
                 agent_loop(messages, perms)
                 try:
-                    with open(history_file, "w") as f: json.dump(messages[-20:], f)
-                except: pass
+                    with open(history_file, "w") as f:
+                        json.dump(messages[-20:], f)
+                except:
+                    pass
                 continue
             else:
                 console.print(f"  [dim]No image in clipboard[/]")
@@ -3111,12 +5186,11 @@ def main(argv=None):
             _handle_deploy(task, messages, perms, system, console)
             continue
 
-        console.print(Rule(style="dim"))
-
         # Handle clipboard image if pasted
         clip_img = _clipboard_image_path[0]
         if clip_img and os.path.isfile(clip_img):
             import base64 as b64mod, shutil
+
             # Save to a permanent file with timestamp
             ts = time.strftime("%Y%m%d_%H%M%S")
             saved_name = f".localcoder-image-{ts}.png"
@@ -3126,16 +5200,30 @@ def main(argv=None):
             sz_kb = os.path.getsize(saved_path) // 1024
             # Clean up the "[📎 image]" prefix from prompt
             task = task.replace("[📎 image]", "").strip() or "What is in this image?"
-            console.print(f"  [magenta]❯[/] [bold]{task}[/]")
+            console.print(_render_user_turn(task, note=f"attached {saved_name} ({sz_kb} KB)"))
             # Show image inline AFTER prompt (now we're in normal terminal mode)
             show_image_inline(saved_path)
-            console.print(f"  [green]📎[/] [dim]{saved_name}[/] [dim green]({sz_kb} KB)[/]\n")
-            messages.append({"role": "user", "content": [
-                {"type": "text", "text": f"{task}\n[Attached image: {saved_path}]"},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-            ]})
+            console.print(
+                f"  [green]📎[/] [dim]{saved_name}[/] [dim green]({sz_kb} KB)[/]\n"
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{task}\n[Attached image: {saved_path}]",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                        },
+                    ],
+                }
+            )
         else:
-            console.print(f"  [magenta]❯[/] [bold]{task}[/]\n")
+            console.print(_render_user_turn(task))
+            console.print()
             messages.append({"role": "user", "content": task})
 
         try:
@@ -3146,8 +5234,10 @@ def main(argv=None):
 
         try:
             safe = [m for m in messages if isinstance(m, dict)]
-            with open(history_file, "w") as f: json.dump(safe[-20:], f)
-        except: pass
+            with open(history_file, "w") as f:
+                json.dump(safe[-20:], f)
+        except:
+            pass
 
     # ── Exit: offer memory cleanup ──
     _cleanup_on_exit()
@@ -3167,6 +5257,7 @@ def _handle_deploy(task, messages, perms, system, console):
 
     # Import builder
     import importlib.util
+
     spec = importlib.util.spec_from_file_location("build", build_module)
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
@@ -3181,27 +5272,35 @@ def _handle_deploy(task, messages, perms, system, console):
     arg = parts[1].strip() if len(parts) > 1 else None
 
     # Direct app ID match
-    if arg and any(a['id'] == arg for a in apps):
-        selected = next(a for a in apps if a['id'] == arg)
+    if arg and any(a["id"] == arg for a in apps):
+        selected = next(a for a in apps if a["id"] == arg)
     elif arg:
         # Fuzzy match or treat as custom description
-        matched = [a for a in apps if arg.lower() in a['id'] or arg.lower() in a.get('title', '').lower()]
+        matched = [
+            a
+            for a in apps
+            if arg.lower() in a["id"] or arg.lower() in a.get("title", "").lower()
+        ]
         if matched:
             selected = matched[0]
         else:
             # Custom: use chatbot template with custom prompt
-            selected = next((a for a in apps if a['id'] == 'chatbot'), apps[0]).copy()
-            selected['title'] = arg[:40]
-            selected['subtitle'] = arg
-            selected['system_prompt'] = f"You are an AI expert for: {arg}. Help the user with detailed, accurate responses. Use emoji and structured formatting."
+            selected = next((a for a in apps if a["id"] == "chatbot"), apps[0]).copy()
+            selected["title"] = arg[:40]
+            selected["subtitle"] = arg
+            selected["system_prompt"] = (
+                f"You are an AI expert for: {arg}. Help the user with detailed, accurate responses. Use emoji and structured formatting."
+            )
     else:
         # Interactive picker
         console.print(f"\n  [bold #34d399]⚡ Deploy — AI App Framework[/]\n")
         for i, a in enumerate(apps, 1):
-            inputs = ', '.join(a.get('inputs', []))
-            model = a.get('model', 'any')
-            console.print(f"  [bold cyan]{i}[/]  {a['icon']}  {a['title']:<20} [dim]{inputs:<18} {model}[/]")
-        console.print(f"  [bold cyan]{len(apps)+1}[/]  🛠️  Custom App")
+            inputs = ", ".join(a.get("inputs", []))
+            model = a.get("model", "any")
+            console.print(
+                f"  [bold cyan]{i}[/]  {a['icon']}  {a['title']:<20} [dim]{inputs:<18} {model}[/]"
+            )
+        console.print(f"  [bold cyan]{len(apps) + 1}[/]  🛠️  Custom App")
         console.print()
 
         try:
@@ -3219,31 +5318,42 @@ def _handle_deploy(task, messages, perms, system, console):
                         return
                 except (EOFError, KeyboardInterrupt):
                     return
-                selected = next((a for a in apps if a['id'] == 'chatbot'), apps[0]).copy()
-                selected['title'] = desc[:40]
-                selected['subtitle'] = desc
-                selected['system_prompt'] = f"You are an AI expert for: {desc}. Help the user. Use emoji and structured markdown."
+                selected = next(
+                    (a for a in apps if a["id"] == "chatbot"), apps[0]
+                ).copy()
+                selected["title"] = desc[:40]
+                selected["subtitle"] = desc
+                selected["system_prompt"] = (
+                    f"You are an AI expert for: {desc}. Help the user. Use emoji and structured markdown."
+                )
             elif 0 <= idx < len(apps):
                 selected = apps[idx]
             else:
                 return
         except ValueError:
             # Typed an app name
-            matched = [a for a in apps if choice.lower() in a['id'] or choice.lower() in a.get('title', '').lower()]
+            matched = [
+                a
+                for a in apps
+                if choice.lower() in a["id"]
+                or choice.lower() in a.get("title", "").lower()
+            ]
             selected = matched[0] if matched else apps[0]
 
     # App output directory
-    default_name = selected['id']
+    default_name = selected["id"]
     try:
         app_name = input(f"  App name [{default_name}]: ").strip() or default_name
     except (EOFError, KeyboardInterrupt):
         return
-    app_name = re.sub(r'[^a-z0-9-]', '-', app_name.lower())
+    app_name = re.sub(r"[^a-z0-9-]", "-", app_name.lower())
     app_dir = os.path.join(CWD, app_name)
 
     console.print(f"\n  {selected['icon']}  [bold]{selected['title']}[/]")
     console.print(f"  [dim]{selected.get('subtitle', '')}[/]")
-    console.print(f"  [dim]Inputs: {', '.join(selected.get('inputs', []))}  Model: {selected.get('model', 'any')}[/]")
+    console.print(
+        f"  [dim]Inputs: {', '.join(selected.get('inputs', []))}  Model: {selected.get('model', 'any')}[/]"
+    )
     console.print(Rule(style="dim"))
 
     # Build
@@ -3255,15 +5365,19 @@ def _handle_deploy(task, messages, perms, system, console):
         if ans not in ("y", "yes"):
             return
         import shutil
+
         shutil.rmtree(app_dir)
 
     console.print(f"  [dim]Building {app_name}...[/]")
 
     # Write custom config if modified
-    app_config_dir = os.path.join(framework_dir, "apps", selected['id'])
-    if selected.get('title') != next((a['title'] for a in apps if a['id'] == selected['id']), None):
+    app_config_dir = os.path.join(framework_dir, "apps", selected["id"])
+    if selected.get("title") != next(
+        (a["title"] for a in apps if a["id"] == selected["id"]), None
+    ):
         # Custom app — write temp config
         import json as _json, tempfile
+
         tmp_app_dir = os.path.join(framework_dir, "apps", "_custom")
         os.makedirs(tmp_app_dir, exist_ok=True)
         with open(os.path.join(tmp_app_dir, "config.json"), "w") as f:
@@ -3272,9 +5386,10 @@ def _handle_deploy(task, messages, perms, system, console):
             builder.build_app("_custom", app_dir)
         finally:
             import shutil
+
             shutil.rmtree(tmp_app_dir, ignore_errors=True)
     else:
-        builder.build_app(selected['id'], app_dir)
+        builder.build_app(selected["id"], app_dir)
 
     file_count = sum(len(files) for _, _, files in os.walk(app_dir))
     console.print(f"  [green]✓[/] Created {file_count} files in {app_name}/")
@@ -3282,8 +5397,14 @@ def _handle_deploy(task, messages, perms, system, console):
     # npm install
     console.print(f"  [dim]Installing dependencies...[/]")
     try:
-        r = subprocess.run("npm install", shell=True, cwd=app_dir,
-                           capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            "npm install",
+            shell=True,
+            cwd=app_dir,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         if r.returncode == 0:
             console.print(f"  [green]✓[/] Dependencies installed")
         else:
@@ -3292,14 +5413,24 @@ def _handle_deploy(task, messages, perms, system, console):
         console.print(f"  [yellow]npm install issue — run manually[/]")
 
     # Summary
-    console.print(f"\n  [green bold]✓ {selected['icon']} {selected['title']} is ready![/]\n")
+    console.print(
+        f"\n  [green bold]✓ {selected['icon']} {selected['title']} is ready![/]\n"
+    )
     console.print(f"  [bold]Run:[/]     cd {app_name} && npm start")
     console.print(f"  [bold]Open:[/]    http://localhost:3000")
     console.print(f"\n  [bold]Switch AI provider:[/]")
-    console.print(f"  [dim]Local:[/]    LLM_API_BASE=http://localhost:8089/v1 npm start")
-    console.print(f"  [dim]OpenAI:[/]   LLM_API_BASE=https://api.openai.com/v1 LLM_API_KEY=sk-... npm start")
-    console.print(f"  [dim]Gemini:[/]   LLM_API_BASE=https://generativelanguage.googleapis.com/v1beta/openai LLM_API_KEY=... npm start")
-    console.print(f"  [dim]Groq:[/]     LLM_API_BASE=https://api.groq.com/openai/v1 LLM_API_KEY=... npm start")
+    console.print(
+        f"  [dim]Local:[/]    LLM_API_BASE=http://localhost:8089/v1 npm start"
+    )
+    console.print(
+        f"  [dim]OpenAI:[/]   LLM_API_BASE=https://api.openai.com/v1 LLM_API_KEY=sk-... npm start"
+    )
+    console.print(
+        f"  [dim]Gemini:[/]   LLM_API_BASE=https://generativelanguage.googleapis.com/v1beta/openai LLM_API_KEY=... npm start"
+    )
+    console.print(
+        f"  [dim]Groq:[/]     LLM_API_BASE=https://api.groq.com/openai/v1 LLM_API_KEY=... npm start"
+    )
 
     # Start?
     console.print()
@@ -3328,62 +5459,140 @@ def _cleanup_on_exit():
         req = urllib.request.Request("http://127.0.0.1:8089/health")
         urllib.request.urlopen(req, timeout=1)
         llama_running = True
-    except: pass
+    except:
+        pass
 
     try:
-        req = urllib.request.Request("http://127.0.0.1:11434/api/ps", headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            "http://127.0.0.1:11434/api/ps",
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read())
             ollama_models = [m.get("name", "") for m in data.get("models", [])]
-    except: pass
+    except:
+        pass
 
     if not llama_running and not ollama_models:
-        console.print(f"  [dim]No models loaded in GPU. bye![/]\n")
+        console.print(
+            f"  [dim]{_t('no_models_loaded') or 'No models loaded in GPU. bye!'}[/]\n"
+        )
         return
 
-    # Show what's using GPU
-    console.print(f"\n  [bold]GPU cleanup[/]", end="")
+    # Show what's using GPU — radiolist dialog (matches /models style)
+    _cleanup_title = _t("gpu_cleanup") or "GPU cleanup"
+    _srv_info = ""
     if llama_running:
-        console.print(f"  [dim]·  llama-server on :8089[/]", end="")
+        _srv_info += "llama-server on :8089"
     if ollama_models:
-        console.print(f"  [dim]·  Ollama: {', '.join(ollama_models)}[/]", end="")
-    console.print()
-    console.print(f"  [bold]1[/] keep running  [bold]2[/] unload models  [bold]3[/] stop all  [bold]enter[/] keep")
-    console.print()
+        if _srv_info:
+            _srv_info += "  ·  "
+        _srv_info += f"Ollama: {', '.join(ollama_models)}"
+
+    opt1 = _t("keep_running") or "keep running"
+    opt2 = _t("unload_models") or "unload models"
+    opt3 = _t("stop_all") or "stop all"
 
     try:
-        ans = input("    ▸ ").strip()
-    except (EOFError, KeyboardInterrupt):
-        ans = "1"
+        from prompt_toolkit.shortcuts import radiolist_dialog
+        from prompt_toolkit.styles import Style as PTStyle
+
+        _cleanup_style = PTStyle.from_dict(
+            {
+                "dialog": "bg:#1a1a2e",
+                "dialog.body": "bg:#1a1a2e #e0e0e0",
+                "dialog frame.label": "bg:#e07a5f #ffffff bold",
+                "dialog shadow": "bg:#000000",
+                "radiolist": "bg:#1a1a2e",
+                "button": "bg:#81b29a #000000 bold",
+                "button.focused": "bg:#e07a5f #ffffff bold",
+            }
+        )
+
+        result = radiolist_dialog(
+            title=f"{_cleanup_title}  ·  {_srv_info}" if _srv_info else _cleanup_title,
+            text=_ui(
+                "What would you like to do?",
+                "ماذا تريد أن تفعل؟",
+                "Que souhaitez-vous faire ?",
+            ),
+            values=[
+                ("1", f"  {opt1}"),
+                ("2", f"  {opt2}"),
+                ("3", f"  {opt3}"),
+            ],
+            style=_cleanup_style,
+        ).run()
+        ans = result or "1"
+    except Exception:
+        # Fallback to text input
+        from rich import box as rbox
+
+        body = (
+            f"  [bold white on #1e293b] 1 [/] [#81b29a]{opt1}[/]\n"
+            f"  [bold white on #1e293b] 2 [/] [#e07a5f]{opt2}[/]\n"
+            f"  [bold white on #1e293b] 3 [/] [red]{opt3}[/]"
+        )
+        console.print(
+            Panel(
+                body,
+                title=f"[bold #c084fc]{_cleanup_title}[/]",
+                subtitle=f"[dim]{_srv_info}[/]" if _srv_info else None,
+                border_style="#3f3f46",
+                box=rbox.ROUNDED,
+                padding=(1, 3),
+                width=min(60, console.width - 4),
+            )
+        )
+        try:
+            ans = input("  ▸ ").strip() or "1"
+        except (EOFError, KeyboardInterrupt):
+            ans = "1"
 
     if ans == "2":
         # Unload Ollama models
         for m in ollama_models:
             try:
                 data = json.dumps({"model": m, "keep_alive": 0}).encode()
-                req = urllib.request.Request("http://127.0.0.1:11434/api/generate",
-                    data=data, headers={"Content-Type": "application/json"})
+                req = urllib.request.Request(
+                    "http://127.0.0.1:11434/api/generate",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                )
                 urllib.request.urlopen(req, timeout=5)
                 console.print(f"    [green]✓[/] [dim]Unloaded {m}[/]")
-            except: pass
-        console.print(f"    [green]✓[/] [dim]Ollama models unloaded[/]")
+            except:
+                pass
+        console.print(
+            f"    [green]✓[/] [dim]{_t('ollama_unloaded') or 'Ollama models unloaded'}[/]"
+        )
 
     elif ans == "3":
         # Kill llama-server
         if llama_running:
             subprocess.run(["pkill", "-f", "llama-server"], capture_output=True)
-            console.print(f"    [green]✓[/] [dim]llama-server stopped[/]")
+            console.print(
+                f"    [green]✓[/] [dim]{_t('llama_stopped') or 'llama-server stopped'}[/]"
+            )
         # Unload Ollama models
         for m in ollama_models:
             try:
                 data = json.dumps({"model": m, "keep_alive": 0}).encode()
-                req = urllib.request.Request("http://127.0.0.1:11434/api/generate",
-                    data=data, headers={"Content-Type": "application/json"})
+                req = urllib.request.Request(
+                    "http://127.0.0.1:11434/api/generate",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                )
                 urllib.request.urlopen(req, timeout=5)
-            except: pass
-        console.print(f"    [green]✓[/] [dim]All models unloaded, GPU memory freed[/]")
+            except:
+                pass
+        console.print(
+            f"    [green]✓[/] [dim]{_t('models_unloaded') or 'All models unloaded, GPU memory freed'}[/]"
+        )
     else:
-        console.print(f"    [dim]Keeping models loaded. bye![/]")
+        console.print(
+            f"    [dim]{_t('keeping_loaded') or 'Keeping models loaded. bye!'}[/]"
+        )
 
     console.print()
 
