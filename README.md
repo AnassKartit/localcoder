@@ -1,129 +1,150 @@
 # localcoder
 
-**The local coding CLI that does the obvious things nobody else does.**
+**Local AI coding agent that generates images, builds apps, and runs 100% on your GPU.**
 
 ```bash
-pipx install localcoder
+pip install localcoder
+localcoder
 ```
 
-I wanted to paste a screenshot into my coding assistant and see it inline. No tool did that locally. So I built one.
+## What It Does
 
-## Cost: $1.30/month vs $110/month
+A CLI coding agent like Claude Code — but runs locally with zero API keys, zero cloud, zero cost.
 
-Running local saves 85-141x compared to cloud APIs:
-
-| Usage | Claude Sonnet | Claude Opus | Local (US) | Local (India) |
-|-------|--------------|-------------|------------|---------------|
-| 4h/day | $55/mo | $91/mo | **$0.65/mo** | $0.29/mo |
-| 8h/day | $110/mo | $183/mo | **$1.30/mo** | $0.58/mo |
-| 10h/day | $137/mo | $228/mo | **$1.62/mo** | $0.72/mo |
-
-*Based on: Gemma 4 26B at 47 tok/s, 30% active generation, M4 Pro 30W. Electricity: [worldpopulationreview.com](https://worldpopulationreview.com/country-rankings/cost-of-electricity-by-country). API: [anthropic.com](https://www.anthropic.com/pricing).*
-
-**Annual savings: ~$1,300-$2,700** depending on usage and API choice.
-
-## What's Actually Different
-
-| Feature | localcoder | aider | OpenCode | Claude Code |
-|---------|-----------|-------|----------|-------------|
-| Paste image, see it inline | **Ctrl+V → shows in terminal** | no | no | cloud only |
-| Voice input (local) | **Ctrl+R → Whisper, no cloud** | no | no | no |
-| See GPU memory while coding | **/gpu → live stats** | no | no | no |
-| Computer use (screenshot + click) | **built-in** | no | no | cloud only |
-| Free GPU when it's slow | **/clean → before/after** | no | no | n/a |
-| Browse HuggingFace models | **built-in model browser** | no | no | n/a |
-| Works offline | **100%** | partial | partial | no |
-| Cost | **$0.00** | API costs | API costs | $20/mo+ |
+- **Generates images locally** — Flux AI on your GPU, not stock photos or placeholders
+- **Builds full web apps** — landing pages, AI-powered backends, interactive games
+- **MCP tool support** — connect any MCP server (image gen, databases, etc.)
+- **Voice input** — Ctrl+R for local Whisper STT
+- **Vision** — Ctrl+V to paste screenshots, PDFs, clipboard images
+- **Session persistence** — resume conversations with `-c`
+- **100% offline** — works on airplane mode
 
 ## Demo
 
 ```
-❯ localcoder
+❯ localcoder --compact --yolo
 
-  localcoder  ·  local AI coding agent  ·  $0.00 forever
+❯ create a pet shop landing page with 3 animal icons
 
-  ┌──────────────────────────────────────────────────┐
-  │  LOCAL CODER                                     │
-  └──────────────────────────────────────────────────┘
+  ⚡ generate_image → dog-icon.png (4s)
+  ⚡ generate_image → cat-icon.png (4s)
+  ⚡ generate_image → rabbit-icon.png (4s)
+  ← Writing index.html (176 lines)
+  ⚡ preview_app → screenshot captured
 
-  ● Gemma 4 26B Q3_K_XL  ·  llama.cpp  ·  128K  ·  ● GPU  ·  47 tok/s
-  ✓ offline  ·  no API keys  ·  no data sent
-
-  ctrl+r voice  ctrl+v image  /gpu stats  /clean free  /models switch
-
-❯ /gpu
-  GPU  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  12/16GB  3GB free
-  Swap 3GB  Pressure normal
-  Model Gemma 4 26B Q3_K_XL  GPU  ctx 128K  footprint 2311MB
+  ✦ 45s · 850 tokens
 ```
 
-## Benchmark — M4 Pro 24GB
+Images generated locally with Flux. HTML written with dark glassmorphism theme. Zero internet.
 
-Real tests, real hardware, no synthetic benchmarks:
+## Cost: $0.00 vs $110/month
 
-| Model | Size | tok/s | Notes |
-|-------|------|-------|-------|
-| **Gemma 4 26B** Q3_K_XL | 12.0GB | 47 | Best overall — vision + tool calling |
-| **Qwen3.5-35B** MoE Q2_K_XL | 11.3GB | 46 | Best coding quality |
-| **Qwen3.5-4B** Q4_K_XL | 2.7GB | 46 | Quick tasks |
-| Gemma 4 E4B Q4_K_M | 5.0GB | 56 | Fastest — good for 16GB Macs |
-| ~~Qwen3.5-27B Dense~~ | ~~13.4GB~~ | ~~7~~ | ~~Swap thrashing — don't use on 24GB~~ |
+| Usage | Claude Sonnet | Claude Opus | localcoder |
+|-------|--------------|-------------|------------|
+| 4h/day | $55/mo | $91/mo | **$0.00** |
+| 8h/day | $110/mo | $183/mo | **$0.00** |
+
+*Electricity cost: ~$1.30/mo on M4 Pro at 30W.*
 
 ## Install
 
 ```bash
 # macOS (Apple Silicon)
-pipx install localcoder
+pip install localcoder
 
-# First run — auto-detects hardware, shows what fits, starts model
+# First run — auto-detects hardware, downloads model, starts
 localcoder
 ```
 
-Needs [llama.cpp](https://github.com/ggml-org/llama.cpp) or [Ollama](https://ollama.com). First run wizard handles this.
+Needs [Ollama](https://ollama.com) or [llama.cpp](https://github.com/ggml-org/llama.cpp). First run wizard handles setup.
 
-## Commands
+## Usage
 
 ```bash
-localcoder                           # interactive coding
-localcoder -p "build a react app"    # one-shot
-localcoder --yolo                    # auto-approve tools
+localcoder                                          # interactive
+localcoder -p "build a react landing page"          # one-shot
+localcoder -m gemma4:e4b --compact --yolo           # E4B with compact prompt
+localcoder -m gemma4:26b --yolo                     # 26B model (needs 24GB+)
+localcoder --system "You are a React expert" --yolo # custom system prompt
+localcoder --system ~/my-prompt.txt --yolo          # system prompt from file
+localcoder -c                                       # continue last session
 ```
 
-### While Coding
+## Tools
 
-| Command | What |
-|---------|------|
+The agent has these built-in tools:
+
+| Tool | What |
+|------|------|
+| `generate_image` | Generate images locally with Flux AI (icons, heroes, portraits) |
+| `write_file` | Write complete files (HTML, JS, Python, etc.) |
+| `read_file` | Read files |
+| `edit_file` | Find and replace in files |
+| `preview_app` | Open HTML in browser, take screenshot to verify |
+| `bash` | Run any shell command |
+| `web_search` | Search the web via DuckDuckGo |
+| `fetch_url` | Fetch any webpage |
+
+### MCP Tools
+
+Connect external MCP servers for additional capabilities:
+
+```json
+// ~/.localcoder/mcp.json
+{
+  "servers": {
+    "localfit-image": {
+      "command": "python3",
+      "args": ["-m", "localfit.mcp_image"]
+    }
+  }
+}
+```
+
+MCP tools are auto-discovered at startup and available to the agent as `mcp__servername__toolname`.
+
+## Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
 | `Ctrl+V` | Paste + display image from clipboard |
 | `Ctrl+R` | Toggle voice input (local Whisper) |
+| `Ctrl+C` | Clear input / double-tap to quit |
+
+## Slash Commands
+
+| Command | Action |
+|---------|--------|
 | `/gpu` | GPU memory, swap, model status |
-| `/clean` | Free GPU memory with before/after |
-| `/models` | Switch model (includes HuggingFace trending) |
+| `/clean` | Free GPU memory |
+| `/models` | Switch model |
+| `/mcp` | Show MCP servers and tools |
+| `/sessions` | List saved sessions |
+| `/handoff` | Generate continuation prompt for new session |
+| `/think` | Toggle reasoning level |
+| `/context` | Show token usage |
 | `/clear` | Clear conversation |
+| `/undo` | Revert last file change |
 
-### Also works with Claude Code
+## Image Generation
 
-Don't want localcoder's agent? Use Claude Code with your local model instead:
+localcoder generates images locally using Flux models — no internet, no API keys, no stock photos.
 
 ```bash
+# Start the image server (needs localfit)
 pip install localfit
-localfit --launch claude --model gemma4-26b
+localfit serve-image klein-4b
+
+# localcoder auto-detects it at localhost:8189
+localcoder --compact --yolo
+❯ create a landing page with cute cat icons
+  → generate_image("cute cat icon, kawaii, pastel pink") → cat.png (4s)
 ```
 
-One command: starts model → configures Claude Code → launches with `--bare` flag.
-See [localfit](https://github.com/AnassKartit/localfit) for details.
-
-### GPU Toolkit (localfit inside)
-
-```bash
-localcoder --simulate               # will this model fit my GPU?
-localcoder --fetch unsloth/...      # check all quants from HuggingFace
-localcoder --bench                  # benchmark models on YOUR hardware
-localcoder --health                 # GPU health dashboard
-localcoder --config opencode        # auto-configure OpenCode for local models
-localcoder --config aider           # auto-configure aider
-```
-
-Also available standalone: `pipx install localfit`
+| Model | Speed (M4 Pro) | Quality |
+|-------|---------------|---------|
+| klein-4b | ~4s/image | Good for icons |
+| schnell | ~15s/image | Better quality |
 
 ## Hardware
 
@@ -131,35 +152,63 @@ Also available standalone: `pipx install localfit`
 |-----|-----|-----------|-------|
 | Air M2 | 8 GB | Qwen 3.5 4B | 50 tok/s |
 | Air M3 | 16 GB | Gemma 4 E4B | 57 tok/s |
-| **Pro M4** | **24 GB** | **Gemma 4 26B Q3_K_XL** | **47 tok/s** |
+| **Pro M4** | **24 GB** | **Gemma 4 26B Q3** | **47 tok/s** |
+| Pro M4 | 48 GB | Gemma 4 26B Q4 | 47 tok/s |
 
-## License
+## New in 0.4.0
 
-Apache-2.0
+- **Local image generation** — generate_image calls local Flux server
+- **MCP tool support** — connect any MCP server via stdio
+- **Session persistence** — JSONL sessions in `~/.localcoder/sessions/`
+- **Smart compaction** — LLM-based structured summarization
+- **Safe command auto-approval** — read-only bash commands don't need confirmation
+- **Compact prompt mode** — `--compact` for small models (E4B)
+- **Custom system prompts** — `--system` flag
+- **Preview tool** — `preview_app` opens HTML and takes screenshot
+- **Tool aliases** — handles hallucinated tool names gracefully
+- **Better error handling** — streaming timeout, partial JSON recovery
 
 ## Security
 
-Sandbox mode is **ON by default**. Protects against destructive model outputs:
+Sandbox mode is **ON by default**:
 
 | Blocked | Examples |
 |---------|----------|
-| Destructive commands | `rm -rf`, `sudo`, `kill`, `mkfs` |
-| Pipe to shell | `curl ... \| bash`, `wget ... \| sh` |
-| Protected paths | `~/.ssh`, `~/.aws`, `~/.env`, `/etc/` |
-| Path traversal | `../../etc/passwd` |
-| Computer use | Disabled in sandbox |
+| Destructive commands | `rm -rf`, `sudo`, `kill` |
+| Pipe to shell | `curl ... \| bash` |
+| Protected paths | `~/.ssh`, `~/.aws`, `/etc/` |
+| Write outside project | Only CWD and /tmp allowed |
 
 ```bash
 localcoder                    # sandboxed (default)
 localcoder --yolo             # auto-approve but sandbox ON
-localcoder --unrestricted     # sandbox OFF (shows warning)
+localcoder --unrestricted     # sandbox OFF (dangerous)
 ```
 
-Approved tools are remembered across sessions (`~/.localcoder/approved_tools.json`).
+## Architecture
 
-## Tests
-
-```bash
-pip install pytest
-pytest tests/ -v      # 19 tests
 ```
+┌─────────────────────────────────────────┐
+│  localcoder CLI                         │
+│  ┌───────────┐  ┌──────────────────┐    │
+│  │ Agent Loop │→│ Gemma 4 (Ollama) │    │
+│  │ 10 turns   │  └──────────────────┘    │
+│  └─────┬─────┘                          │
+│        │ tool calls                      │
+│  ┌─────┴──────────────────────────┐     │
+│  │ generate_image → Flux (local)  │     │
+│  │ write_file → disk              │     │
+│  │ preview_app → browser + screenshot│  │
+│  │ bash → shell                   │     │
+│  │ mcp__* → MCP servers (stdio)   │     │
+│  └────────────────────────────────┘     │
+│                                         │
+│  Sessions: ~/.localcoder/sessions/*.jsonl│
+│  Skills: .agents/skills/*/SKILL.md      │
+│  MCP: ~/.localcoder/mcp.json            │
+└─────────────────────────────────────────┘
+```
+
+## License
+
+Apache-2.0
