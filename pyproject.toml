@@ -35,6 +35,9 @@ localcoder = "localcoder.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/localcoder"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [".venv*", "voices/", "*.png", "*.wav", "*.gguf", "node_modules/"]
+
 [project.urls]
 Homepage = "https://github.com/AnassKartit/localcoder"
 Repository = "https://github.com/AnassKartit/localcoder"
