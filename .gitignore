@@ -38,3 +38,6 @@ localcoder_finetune.jsonl
 localcoder-e4b-gguf/
 localcoder-e4b-lora/
 Modelfile
+src/localcoder/finetune/dataset.py
+src/localcoder/finetune/*.ipynb
+*.jsonl
