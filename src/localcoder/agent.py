@@ -8,6 +8,8 @@ def run_agent(api_base, model, args):
 
     os.environ["GEMMA_API_BASE"] = api_base
     os.environ["GEMMA_MODEL"] = model
+    if getattr(args, "arabic", False):
+        os.environ["LOCALCODER_UI_LANG"] = "ar"
 
     argv = []
     if args.prompt:
@@ -16,6 +18,8 @@ def run_agent(api_base, model, args):
         argv += ["-c"]
     if args.model:
         argv += ["-m", model]
+    if getattr(args, "arabic", False):
+        argv += ["-ar"]
     if args.yolo or args.bypass:
         argv += ["--yolo"]
     if args.ask:
@@ -25,5 +29,9 @@ def run_agent(api_base, model, args):
 
     if getattr(args, "unrestricted", False):
         argv += ["--unrestricted"]
+    if getattr(args, "compact", False):
+        argv += ["--compact"]
+    if getattr(args, "system", None):
+        argv += ["--system", args.system]
 
     agent_main(argv)

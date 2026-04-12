@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "localcoder"
-version = "0.3.0"
-description = "Local AI coding agent — auto-installs, auto-serves, zero config. Works with Gemma 4, Qwen 3.5, and any model via llama.cpp or Ollama."
+version = "0.4.0"
+description = "Local AI coding agent with image generation, MCP tools, session persistence. Runs 100% on GPU — Gemma 4 + Flux. No API keys."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
@@ -25,6 +25,8 @@ dependencies = [
     "huggingface-hub>=0.20",
     "textual>=0.58",
     "ddgs>=7.0",
+    "arabic-reshaper>=3.0.0",
+    "python-bidi>=0.6.0",
 ]
 
 [project.scripts]

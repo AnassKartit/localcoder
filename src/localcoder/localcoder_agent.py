@@ -3,6 +3,11 @@
 
 import os, subprocess, sys, json, urllib.request, urllib.parse, time, re, argparse, logging, signal, threading, random
 
+from localcoder.agent_session import Session, get_latest_session_id, list_sessions
+from localcoder.compaction import compress_messages as smart_compress_messages
+from localcoder.safe_commands import is_safe_command, classify_command
+from localcoder.mcp_client import init_mcp, get_mcp_manager
+
 from rich import box
 from rich.console import Console, Group
 from rich.markdown import Markdown
@@ -206,8 +211,8 @@ def _rewrite_photo_search_query(query):
     if any(term in lower for term in ("logo", "illustration", "vector", "wallpaper")):
         return cleaned
     if any(term in lower for term in ("photo", "photos", "صورة", "صور")):
-        return f"{cleaned} real photo official press -wallpaper -portrait -headshot -ai -\"stable diffusion\""
-    return f"{cleaned} official press photo -wallpaper -portrait -headshot -ai -\"stable diffusion\""
+        return f'{cleaned} real photo official press -wallpaper -portrait -headshot -ai -"stable diffusion"'
+    return f'{cleaned} official press photo -wallpaper -portrait -headshot -ai -"stable diffusion"'
 
 
 def _is_image_only_request(text):
@@ -267,9 +272,14 @@ def _rank_image_candidate(url, title="", source=""):
         score += 20
     if re.search(r"\.(png|jpe?g|webp|gif|bmp|svg)(\?|$)", url or "", re.I):
         score += 10
-    if any(host in (url or "").lower() for host in ("images.", "img.", "media.", "cdn.")):
+    if any(
+        host in (url or "").lower() for host in ("images.", "img.", "media.", "cdn.")
+    ):
         score += 3
-    if any(host in (url or "").lower() for host in ("pinterest.", "facebook.", "instagram.", "tiktok.")):
+    if any(
+        host in (url or "").lower()
+        for host in ("pinterest.", "facebook.", "instagram.", "tiktok.")
+    ):
         score -= 20
     return score
 
@@ -284,7 +294,9 @@ def _sort_image_candidates(candidates):
         seen.add(url)
         ranked.append(
             (
-                _rank_image_candidate(url, candidate.get("title", ""), candidate.get("source", "")),
+                _rank_image_candidate(
+                    url, candidate.get("title", ""), candidate.get("source", "")
+                ),
                 candidate,
             )
         )
@@ -296,7 +308,11 @@ def _extract_image_candidates_from_text(text, source_url=""):
     found = []
     for url in re.findall(r"!\[[^\]]*\]\((https?://[^\)]+)\)", text or ""):
         found.append({"url": url, "title": "", "source": source_url})
-    for url in re.findall(r'(https?://[^\s"\'<>()]+(?:png|jpg|jpeg|webp|gif|bmp|svg)(?:\?[^\s"\'<>()]*)?)', text or "", re.I):
+    for url in re.findall(
+        r'(https?://[^\s"\'<>()]+(?:png|jpg|jpeg|webp|gif|bmp|svg)(?:\?[^\s"\'<>()]*)?)',
+        text or "",
+        re.I,
+    ):
         found.append({"url": url, "title": "", "source": source_url})
     return _sort_image_candidates(found)
 
@@ -304,7 +320,9 @@ def _extract_image_candidates_from_text(text, source_url=""):
 def _resolve_whisper_model(language, cfg=None):
     cfg = cfg or {}
     whisper_home = os.path.expanduser("~/.local/share/whisper")
-    env_specific = os.environ.get(f"LOCALCODER_WHISPER_MODEL_{(language or '').upper()}")
+    env_specific = os.environ.get(
+        f"LOCALCODER_WHISPER_MODEL_{(language or '').upper()}"
+    )
     env_default = os.environ.get("LOCALCODER_WHISPER_MODEL")
     cfg_specific = cfg.get(f"voice_whisper_model_{language}") if language else None
     cfg_default = cfg.get("voice_whisper_model")
@@ -548,6 +566,9 @@ def _ui(en, ar=None, fr=None):
 # ── Config ──
 API_BASE = os.environ.get("GEMMA_API_BASE", "http://127.0.0.1:8089/v1")
 MODEL = os.environ.get("GEMMA_MODEL", "gemma4-26b")
+# Vision model (UI-TARS) for screenshot grounding — separate from brain model
+VISION_API_BASE = os.environ.get("VISION_API_BASE", "")  # e.g. http://127.0.0.1:8090/v1
+VISION_MODEL = os.environ.get("VISION_MODEL", "")  # e.g. UI-TARS-1.5-7B
 CWD = os.getcwd()
 REASONING_EFFORT = "medium"  # none, low, medium, high — toggle with /think
 
@@ -577,8 +598,16 @@ def detect_backend():
             data = json.loads(resp.read())
         models = data.get("data", [])
         if models:
+            # Prefer the model matching what the user selected (MODEL),
+            # otherwise fall back to the first model in the list
             m = models[0]
             mid = m.get("id", MODEL)
+            for candidate in models:
+                cid = candidate.get("id", "")
+                if MODEL.lower().replace(":", "-").replace("_", "") in cid.lower().replace(":", "-").replace("_", ""):
+                    mid = cid
+                    m = candidate
+                    break
             info["model_name"] = mid
 
             # Parse quant from model ID (e.g. "gemma-4-26B-A4B-it-UD-Q3_K_XL")
@@ -820,7 +849,9 @@ def _test_screen():
 
     tmp = tempfile.mktemp(suffix=".png")
     try:
-        subprocess.run(["screencapture", "-x", tmp], capture_output=True, timeout=5)
+        subprocess.run(
+            ["screencapture", "-D1", "-x", tmp], capture_output=True, timeout=5
+        )
         return os.path.exists(tmp) and os.path.getsize(tmp) > 1000
     finally:
         if os.path.exists(tmp):
@@ -1499,10 +1530,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "bash",
-            "description": "Run any shell command.",
+            "description": "Run a shell command and return stdout+stderr. Use for: installing packages (npm install), running servers (node server.js &), testing (curl), git, and any system command.",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string"}},
+                "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
                 "required": ["command"],
             },
         },
@@ -1511,12 +1542,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Create or overwrite a file.",
+            "description": "Create or overwrite a file with content. ALWAYS use this to write code — never put code in chat messages. The path must be a filename like 'index.html', not a directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
+                    "path": {"type": "string", "description": "File path relative to CWD (e.g. 'index.html', 'server.js')"},
+                    "content": {"type": "string", "description": "Complete file content to write"},
                 },
                 "required": ["path", "content"],
             },
@@ -1526,7 +1557,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file.",
+            "description": "Read a file and return its contents. Only read a file ONCE — don't re-read files you already have.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -1538,13 +1569,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Find and replace text in a file.",
+            "description": "Find and replace text in an existing file. The old_text must match exactly.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "old_text": {"type": "string"},
-                    "new_text": {"type": "string"},
+                    "old_text": {"type": "string", "description": "Exact text to find"},
+                    "new_text": {"type": "string", "description": "Replacement text"},
                 },
                 "required": ["path", "old_text", "new_text"],
             },
@@ -1553,8 +1584,54 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "generate_image",
+            "description": "Generate an image from a text prompt using local AI (Flux). Saves the image to disk and displays it in the terminal. Call this BEFORE write_file when building pages that need images. Example: generate_image(prompt='cute cat icon, kawaii, flat design', filename='cat.png')",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Image description. Be specific: style, subject, colors. Example: 'minimalist mountain logo, blue gradient, white background'",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Output filename like 'hero.png' or 'icon-cat.png'. Must end in .png",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Image size WxH. Use 256x256 for icons, 512x512 for medium, 1024x1024 for large. Default: 512x512",
+                    },
+                    "steps": {
+                        "type": "integer",
+                        "description": "Quality steps. 2=fast, 4=good, 8=best. Default: 4",
+                    },
+                },
+                "required": ["prompt", "filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "preview_app",
+            "description": "Open an HTML file in the browser, take a screenshot, and display it in the terminal. Use this AFTER writing an HTML file to verify it looks correct. If something looks wrong, fix it and preview again.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the HTML file to preview (e.g. 'index.html')",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
-            "description": "Search the web via DuckDuckGo. For photo/image queries, prefer direct image URLs and real-photo results over article pages, logos, or illustrations.",
+            "description": "Search the web via DuckDuckGo. Use for finding info, docs, APIs. Do NOT use for finding images — use generate_image instead.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
@@ -1566,7 +1643,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "fetch_url",
-            "description": "Fetch a URL and return status + body. Extract article images via Jina Reader and og:image when possible.",
+            "description": "Fetch a URL and return its content as text.",
             "parameters": {
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
@@ -1578,34 +1655,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_pdf",
-            "description": "Read a PDF file. Extracts text and renders pages as images for visual understanding of charts, diagrams, layouts. Use for any PDF.",
+            "description": "Read a PDF file. Extracts text and page images.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path to the PDF file"},
-                    "pages": {
-                        "type": "string",
-                        "description": "Page range: 'all', '1', '1-3', '2,5,8'. Default: first 5 pages.",
-                    },
+                    "path": {"type": "string", "description": "Path to PDF file"},
+                    "pages": {"type": "string", "description": "Page range: 'all', '1-3', '2,5'. Default: first 5"},
                 },
                 "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "computer_use",
-            "description": "Control the Mac GUI. Every action automatically takes a screenshot and reads the screen content. Actions: scroll (SCROLL PAGE DOWN to see more content), click:x,y (click at coordinates 0-1000), type:text, key:name, hotkey:cmd+key, open:URL_or_AppName, wait:seconds. IMPORTANT: Use 'scroll' to see more content on a page. Do NOT call 'screenshot' repeatedly.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Action: 'scroll' (page down), 'scroll up', 'click:500,300', 'type:hello world', 'key:return', 'hotkey:cmd+a', 'open:https://x.com/search?q=AI', 'open:WhatsApp', 'wait:2'",
-                    }
-                },
-                "required": ["action"],
             },
         },
     },
@@ -1703,17 +1760,48 @@ def exec_tool(name, args):
                     'curl -L -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ',
                     1,
                 )
+        # Longer timeout for server starts and installs
+        cmd_timeout = 120 if any(k in cmd for k in ("npm install", "pip install", "node server", "python3 -m http")) else 60
         try:
             r = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, cwd=CWD, timeout=60
+                cmd, shell=True, capture_output=True, text=True, cwd=CWD, timeout=cmd_timeout
             )
-            return (r.stdout + r.stderr).strip()[:4000] or "(no output)"
+            output = (r.stdout + r.stderr).strip()
+            if not output:
+                return "(no output)"
+            # Tail-truncate: keep last N lines (errors are at the end)
+            if len(output) > 4000:
+                lines = output.splitlines()
+                # Keep first 5 lines + last lines that fit in budget
+                head = "\n".join(lines[:5])
+                tail_lines = []
+                tail_size = 0
+                for line in reversed(lines[5:]):
+                    if tail_size + len(line) + 1 > 3500:
+                        break
+                    tail_lines.insert(0, line)
+                    tail_size += len(line) + 1
+                return head + "\n...(truncated middle)...\n" + "\n".join(tail_lines)
+            return output
         except subprocess.TimeoutExpired:
-            return "Command started (timeout normal for servers)."
+            return f"Command timed out after {cmd_timeout}s (normal for servers/long installs)."
     elif name == "write_file":
-        path = args.get("path", "")
+        path = args.get("path", "") or args.get("filename", "")
         content = args.get("content", "")
+        # Auto-fix empty path — guess from content
+        if not path or path.endswith("/"):
+            if content.strip().startswith("<!DOCTYPE") or content.strip().startswith("<html"):
+                path = "index.html"
+            elif content.strip().startswith("{"):
+                path = "data.json"
+            elif "const " in content or "require(" in content:
+                path = "server.js"
+            else:
+                path = "output.txt"
+            logging.getLogger("localcoder").warning(f"write_file: empty path, auto-assigned '{path}'")
         full = os.path.join(CWD, path) if not os.path.isabs(path) else path
+        if os.path.isdir(full):
+            return f"Error: '{path}' is a directory, not a file. Provide a filename like '{path}index.html'"
         snapshot_file(path)  # backup before overwrite
         os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         with open(full, "w") as f:
@@ -1815,7 +1903,9 @@ def exec_tool(name, args):
                         # Put images FIRST so they don't get truncated
                         if good:
                             try:
-                                show_image_url(good[0]["url"], max_width=50, max_height=12)
+                                show_image_url(
+                                    good[0]["url"], max_width=50, max_height=12
+                                )
                             except Exception:
                                 pass
                             parts.append(
@@ -1844,7 +1934,10 @@ def exec_tool(name, args):
                         r'https?://[^\s"\'<>]+\.(?:png|jpg|jpeg|webp|gif)', raw
                     )
                     all_imgs = _sort_image_candidates(
-                        [{"url": image_url, "title": "", "source": url} for image_url in (og + imgs)]
+                        [
+                            {"url": image_url, "title": "", "source": url}
+                            for image_url in (og + imgs)
+                        ]
                     )
                     text = re.sub(
                         r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL
@@ -1860,7 +1953,9 @@ def exec_tool(name, args):
                     )
                     if all_imgs:
                         try:
-                            show_image_url(all_imgs[0]["url"], max_width=50, max_height=12)
+                            show_image_url(
+                                all_imgs[0]["url"], max_width=50, max_height=12
+                            )
                         except Exception:
                             pass
                     return f"Status: {resp.status}\n{text[:1500]}{img_str}"
@@ -2049,8 +2144,7 @@ def exec_tool(name, args):
                     int(coords.split(",")[0].strip()),
                     int(coords.split(",")[1].strip()),
                 )
-                # Convert from 1000x1000 normalized to actual screen coordinates
-                # Get screen size
+                # Get screen size for coordinate conversion
                 try:
                     _scr = subprocess.run(
                         [
@@ -2066,8 +2160,13 @@ def exec_tool(name, args):
                     scr_w, scr_h = int(_parts[2]), int(_parts[3])
                 except:
                     scr_w, scr_h = 1512, 982  # fallback M4 Pro
-                sx = int(x * scr_w / 1000)
-                sy = int(y * scr_h / 1000)
+                # If coordinates are already in screen space (from tars_screenshot),
+                # use them directly. Otherwise convert from 0-1000 normalized grid.
+                if x > 1000 or y > 1000:
+                    sx, sy = x, y  # already screen coordinates from UI-TARS
+                else:
+                    sx = int(x * scr_w / 1000)
+                    sy = int(y * scr_h / 1000)
                 # Bring last app to front before clicking
                 subprocess.run(
                     [
@@ -2082,7 +2181,7 @@ def exec_tool(name, args):
                 subprocess.run(
                     ["cliclick", f"c:{sx},{sy}"], capture_output=True, timeout=3
                 )
-                action_result = f"Clicked at screen ({sx},{sy}) from bbox ({x},{y})"
+                action_result = f"Clicked at screen ({sx},{sy}) from input ({x},{y})"
                 time.sleep(0.3)
             elif action.startswith("type:"):
                 text = action.split(":", 1)[1]
@@ -2096,6 +2195,29 @@ def exec_tool(name, args):
                     timeout=3,
                 )
                 action_result = f"Typed: {text}"
+                # Auto-URL-Enter: detect URL patterns and press Enter
+                _url_exts = [
+                    ".com",
+                    ".org",
+                    ".net",
+                    ".io",
+                    ".dev",
+                    ".ai",
+                    ".edu",
+                    ".gov",
+                ]
+                if any(ext in text.lower() for ext in _url_exts):
+                    time.sleep(0.2)
+                    subprocess.run(
+                        [
+                            "osascript",
+                            "-e",
+                            'tell application "System Events" to key code 36',
+                        ],
+                        capture_output=True,
+                        timeout=3,
+                    )
+                    action_result += " (auto-pressed Enter for URL)"
                 time.sleep(0.3)
             elif action.startswith("key:"):
                 key = action.split(":", 1)[1].strip()
@@ -2215,7 +2337,7 @@ def exec_tool(name, args):
 
             ss_path = "/tmp/localcoder-screen.png"
             subprocess.run(
-                ["screencapture", "-x", ss_path], capture_output=True, timeout=5
+                ["screencapture", "-D1", "-x", ss_path], capture_output=True, timeout=5
             )
             subprocess.run(
                 ["sips", "-Z", "1000", ss_path, "--out", ss_path],
@@ -2227,19 +2349,22 @@ def exec_tool(name, args):
             show_image_inline(ss_path)
 
             # Auto-read the screenshot content (like ADK's current_state)
+            # Use dedicated vision model (UI-TARS) if configured, otherwise fall back to main model
             screen_desc = ""
+            _vision_api = VISION_API_BASE or API_BASE
+            _vision_model = VISION_MODEL or MODEL
             try:
                 img_data = _b64.b64encode(open(ss_path, "rb").read()).decode()
                 vision_payload = json.dumps(
                     {
-                        "model": MODEL,
+                        "model": _vision_model,
                         "messages": [
                             {
                                 "role": "user",
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": "Extract the MAIN CONTENT from this screenshot. Ignore browser chrome/menus. Focus on: posts, tweets, articles, chat messages, search results, form data. Report as structured data.",
+                                        "text": "Describe this screenshot for a computer-use agent. List ALL visible UI elements with their approximate (x, y) coordinates on a 0-1000 scale where (0,0) is top-left and (1000,1000) is bottom-right. Format each element as: - element_description (x, y)\nFocus on: buttons, links, text fields, search bars, tabs, menus, icons. Also briefly describe the main content visible on screen.",
                                     },
                                     {
                                         "type": "image_url",
@@ -2254,7 +2379,7 @@ def exec_tool(name, args):
                     }
                 ).encode()
                 vision_req = urllib.request.Request(
-                    f"{API_BASE}/chat/completions",
+                    f"{_vision_api}/chat/completions",
                     data=vision_payload,
                     headers={"Content-Type": "application/json"},
                 )
@@ -2265,44 +2390,409 @@ def exec_tool(name, args):
                     "reasoning_content", ""
                 )
                 # Strip reasoning preamble — find where actual data starts
-                for marker in [
-                    "```",
-                    "{",
-                    "**",
-                    "1.",
-                    "- ",
-                    "•",
-                    "Post",
-                    "Tweet",
-                    "@",
-                    "Author",
-                ]:
+                for marker in ["- ", "•", "**", "1.", "```", "{"]:
                     idx = screen_desc.find(marker)
                     if idx > 0 and idx < 300:
                         screen_desc = screen_desc[idx:]
                         break
                 # Remove common preamble sentences
                 for phrase in [
-                    "I need to extract",
+                    "I need to",
                     "The user wants",
                     "Let me analyze",
-                    "The screenshot shows",
+                    "Let me describe",
                     "I will now",
-                    "Ignore browser",
                 ]:
                     if screen_desc.lstrip().startswith(phrase):
                         nl = screen_desc.find("\n\n")
                         if nl > 0:
                             screen_desc = screen_desc[nl + 2 :]
-                screen_desc = screen_desc[:2000]
+                screen_desc = screen_desc[:2500]
             except:
                 screen_desc = "(could not read screen)"
 
-            return f"{action_result}\n\n[SCREEN CONTENT]:\n{screen_desc}\n\n[NEXT ACTION]: To see MORE content, call computer_use with action:scroll. To click something, use action:click:x,y (0-1000 coords). To finish, describe what you found. Do NOT call action:screenshot again — every action already captures the screen."
+            return f"{action_result}\n\n[SCREEN CONTENT — UI elements with (x,y) coordinates on 0-1000 scale]:\n{screen_desc}\n\n[NEXT ACTION]: Use action:click:x,y to click a UI element (use the coordinates above). Use action:type:text to type. Use action:scroll to see more. Use action:open:URL to navigate. Do NOT call action:screenshot again — every action already captures the screen."
 
         except Exception as e:
             return f"Computer use error: {e}"
 
+    elif name == "tars_screenshot":
+        # ── UI-TARS vision grounding tool ──
+        # Takes screenshot, sends to UI-TARS on VISION_API_BASE, returns recommended action + coordinates
+        import base64 as _b64, math as _math
+
+        task_ctx = args.get("task_context", "complete the user's task")
+        _tars_api = VISION_API_BASE or "http://127.0.0.1:8090/v1"
+        _tars_model = VISION_MODEL or "UI-TARS-1.5-7B"
+
+        try:
+            # 1. Bring target app to front
+            if not hasattr(exec_tool, "_last_app"):
+                exec_tool._last_app = "Google Chrome"
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'tell application "{exec_tool._last_app}" to activate',
+                ],
+                capture_output=True,
+                timeout=3,
+            )
+            time.sleep(0.5)
+
+            # 2. Screenshot main display only (-D1), resize to 1000px
+            ss_path = "/tmp/localcoder-tars-screen.png"
+            ss_small = "/tmp/localcoder-tars-sm.png"
+            subprocess.run(
+                ["screencapture", "-D1", "-x", ss_path], capture_output=True, timeout=5
+            )
+            subprocess.run(
+                ["sips", "-Z", "1000", ss_path, "--out", ss_small],
+                capture_output=True,
+                timeout=5,
+            )
+
+            # Display inline
+            show_image_inline(ss_small)
+
+            # 3. Compute smart_resize grid (Qwen2.5-VL vision encoder)
+            try:
+                _sips = subprocess.run(
+                    ["sips", "-g", "pixelWidth", "-g", "pixelHeight", ss_small],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                _iw, _ih = 1000, 649
+                for _l in _sips.stdout.split("\n"):
+                    if "pixelWidth" in _l:
+                        _iw = int(_l.split(":")[-1])
+                    elif "pixelHeight" in _l:
+                        _ih = int(_l.split(":")[-1])
+
+                def _smart_resize(
+                    h, w, factor=28, mn=100 * 28 * 28, mx=16384 * 28 * 28
+                ):
+                    hb = max(factor, round(h / factor) * factor)
+                    wb = max(factor, round(w / factor) * factor)
+                    if hb * wb > mx:
+                        b = _math.sqrt((h * w) / mx)
+                        hb = _math.floor(h / b / factor) * factor
+                        wb = _math.floor(w / b / factor) * factor
+                    elif hb * wb < mn:
+                        b = _math.sqrt(mn / (h * w))
+                        hb = _math.ceil(h * b / factor) * factor
+                        wb = _math.ceil(w * b / factor) * factor
+                    return hb, wb
+
+                _model_h, _model_w = _smart_resize(_ih, _iw)
+            except Exception:
+                _model_w, _model_h = 1008, 644  # fallback
+
+            # Get actual screen size
+            try:
+                _scr = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        'tell application "Finder" to get bounds of window of desktop',
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                _parts = _scr.stdout.strip().split(", ")
+                _scr_w, _scr_h = int(_parts[2]), int(_parts[3])
+            except Exception:
+                _scr_w, _scr_h = 1512, 982
+
+            # 4. Build action history from conversation
+            _action_hist = ""
+            if hasattr(exec_tool, "_tars_history"):
+                if exec_tool._tars_history:
+                    _action_hist = (
+                        "\nPrevious actions:\n"
+                        + "\n".join(
+                            f"  {i + 1}. {a}"
+                            for i, a in enumerate(exec_tool._tars_history[-8:])
+                        )
+                        + "\n"
+                    )
+            else:
+                exec_tool._tars_history = []
+
+            # 5. Send to UI-TARS
+            _tars_system = """You are a GUI agent. You are given a task and your action history, with screenshots. You need to perform the next action to complete the task.
+
+## Output Format
+```
+Thought: ...
+Action: ...
+```
+
+## Action Space
+click(start_box='(x1,y1)')
+left_double(start_box='(x1,y1)')
+right_single(start_box='(x1,y1)')
+drag(start_box='(x1,y1)', end_box='(x2,y2)')
+hotkey(key='ctrl c')
+type(content='xxx')
+scroll(start_box='(x1,y1)', direction='down or up or right or left')
+wait()
+finished(content='xxx')
+
+## Note
+- Use English in Thought part.
+- Write a small plan and finally summarize your next action in one sentence in Thought part.
+"""
+            img_b64 = _b64.b64encode(open(ss_small, "rb").read()).decode()
+            tars_payload = json.dumps(
+                {
+                    "model": _tars_model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": _tars_system
+                            + f"\n## User Instruction\n{task_ctx}",
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{img_b64}"
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"{_action_hist}Current screenshot attached. What is the next action?",
+                                },
+                            ],
+                        },
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 400,
+                }
+            ).encode()
+            tars_req = urllib.request.Request(
+                f"{_tars_api}/chat/completions",
+                data=tars_payload,
+                headers={"Content-Type": "application/json"},
+            )
+            tars_resp = urllib.request.urlopen(tars_req, timeout=120)
+            tars_r = json.loads(tars_resp.read())
+            tars_text = tars_r["choices"][0]["message"]["content"]
+            console.print(f"  [dim cyan]UI-TARS: {tars_text[:200]}[/]")
+
+            # 6. Parse UI-TARS response — extract Thought and Action
+            import re as _re
+
+            _thought = ""
+            _action_raw = ""
+            _t_match = _re.search(
+                r"Thought:\s*(.+?)(?=Action:|$)", tars_text, _re.DOTALL
+            )
+            if _t_match:
+                _thought = _t_match.group(1).strip()
+            _a_match = _re.search(r"Action:\s*(.+?)(?:\n\n|$)", tars_text, _re.DOTALL)
+            if _a_match:
+                _action_raw = _a_match.group(1).strip()
+
+            # Track history
+            if _action_raw:
+                exec_tool._tars_history.append(_action_raw)
+
+            # 7. Convert UI-TARS coordinates to computer_use format
+            _instructions = []
+            if not _action_raw:
+                _instructions.append(
+                    "UI-TARS could not determine an action. Try scrolling or waiting."
+                )
+            else:
+                # Parse click
+                _click_m = _re.search(
+                    r"click\(start_box=['\"][\(\[]([\d.]+),\s*([\d.]+)[\)\]]['\"]",
+                    _action_raw,
+                )
+                if _click_m:
+                    _mx, _my = float(_click_m.group(1)), float(_click_m.group(2))
+                    _sx = int(_mx / _model_w * _scr_w)
+                    _sy = int(_my / _model_h * _scr_h)
+                    _instructions.append(
+                        f"CLICK at screen coordinates ({_sx},{_sy}) — use: computer_use action:click:{_sx},{_sy}"
+                    )
+
+                # Parse type
+                _type_m = _re.search(r"type\(content=['\"](.+?)['\"]\)", _action_raw)
+                if _type_m:
+                    _txt = _type_m.group(1)
+                    _instructions.append(
+                        f"TYPE text: {_txt} — use: computer_use action:type:{_txt}"
+                    )
+                    # Auto-URL-Enter detection
+                    _url_exts = [
+                        ".com",
+                        ".org",
+                        ".net",
+                        ".io",
+                        ".dev",
+                        ".ai",
+                        ".edu",
+                        ".gov",
+                    ]
+                    if any(ext in _txt.lower() for ext in _url_exts):
+                        _instructions.append(
+                            "This looks like a URL — also press Enter after: computer_use action:key:return"
+                        )
+
+                # Parse hotkey
+                _hk_m = _re.search(r"hotkey\(key=['\"](.+?)['\"]\)", _action_raw)
+                if _hk_m:
+                    _keys = _hk_m.group(1).strip()
+                    # Convert "ctrl c" → "cmd+c" for macOS
+                    _keys_mac = _keys.replace("ctrl ", "cmd+").replace(" ", "+")
+                    _instructions.append(
+                        f"HOTKEY: {_keys} — use: computer_use action:hotkey:{_keys_mac}"
+                    )
+
+                # Parse scroll
+                _scr_m = _re.search(
+                    r"scroll\(.*?direction=['\"](\w+)['\"]", _action_raw
+                )
+                if _scr_m:
+                    _dir = _scr_m.group(1)
+                    _instructions.append(
+                        f"SCROLL {_dir} — use: computer_use action:scroll {_dir}"
+                    )
+
+                # Parse drag
+                _drag_m = _re.search(
+                    r"drag\(start_box=['\"][\(\[]([\d.]+),\s*([\d.]+)[\)\]]['\"],\s*end_box=['\"][\(\[]([\d.]+),\s*([\d.]+)[\)\]]['\"]",
+                    _action_raw,
+                )
+                if _drag_m:
+                    _dx1 = int(float(_drag_m.group(1)) / _model_w * _scr_w)
+                    _dy1 = int(float(_drag_m.group(2)) / _model_h * _scr_h)
+                    _dx2 = int(float(_drag_m.group(3)) / _model_w * _scr_w)
+                    _dy2 = int(float(_drag_m.group(4)) / _model_h * _scr_h)
+                    _instructions.append(
+                        f"DRAG from ({_dx1},{_dy1}) to ({_dx2},{_dy2})"
+                    )
+
+                # Parse wait
+                if "wait()" in _action_raw:
+                    _instructions.append("WAIT — use: computer_use action:wait:3")
+
+                # Parse finished
+                _fin_m = _re.search(r"finished\(content=['\"](.+?)['\"]\)", _action_raw)
+                if _fin_m:
+                    _instructions.append(f"TASK COMPLETE: {_fin_m.group(1)}")
+
+                # Parse double-click
+                _dbl_m = _re.search(
+                    r"left_double\(start_box=['\"][\(\[]([\d.]+),\s*([\d.]+)[\)\]]['\"]",
+                    _action_raw,
+                )
+                if _dbl_m:
+                    _mx, _my = float(_dbl_m.group(1)), float(_dbl_m.group(2))
+                    _sx = int(_mx / _model_w * _scr_w)
+                    _sy = int(_my / _model_h * _scr_h)
+                    _instructions.append(
+                        f"DOUBLE-CLICK at ({_sx},{_sy}) — use: computer_use action:click:{_sx},{_sy} (twice)"
+                    )
+
+            _result = f"[UI-TARS Vision Analysis]\n"
+            _result += f"Thought: {_thought}\n"
+            _result += f"Raw action: {_action_raw}\n"
+            _result += f"Grid: {_model_w}x{_model_h} → Screen: {_scr_w}x{_scr_h}\n\n"
+            _result += "Recommended actions:\n" + "\n".join(
+                f"  → {inst}" for inst in _instructions
+            )
+            _result += "\n\nIMPORTANT: Use the EXACT screen coordinates above with computer_use. Do NOT call tars_screenshot again until you've executed the recommended action."
+
+            return _result
+
+        except Exception as e:
+            import traceback
+
+            return f"tars_screenshot error: {e}\n{traceback.format_exc()}"
+
+    elif name == "generate_image":
+        prompt_text = args.get("prompt", "")
+        filename = args.get("filename", "generated-image.png")
+        size = args.get("size", "512x512")
+        steps = args.get("steps", 4)
+        if not prompt_text:
+            return "Error: prompt is required"
+        if not any(filename.lower().endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp")):
+            filename += ".png"
+        out_path = os.path.join(CWD, filename)
+
+        # Try local image server first (localfit at :8189)
+        local_endpoint = os.environ.get("LOCALFIT_IMAGE_ENDPOINT", "http://127.0.0.1:8189")
+        try:
+            import base64 as _b64gen
+            payload = json.dumps({"prompt": prompt_text, "size": size, "steps": steps}).encode()
+            req = urllib.request.Request(
+                f"{local_endpoint}/v1/images/generations",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            console.print(f"  [dim]Generating image locally ({size}, {steps} steps)…[/]")
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                result = json.loads(resp.read())
+            elapsed = time.time() - t0
+
+            if "error" in result:
+                return f"Error: {result['error'].get('message', 'unknown')}"
+
+            b64 = result["data"][0]["b64_json"]
+            img_bytes = _b64gen.b64decode(b64)
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            with open(out_path, "wb") as f:
+                f.write(img_bytes)
+
+            show_image_inline(out_path)
+            sz = len(img_bytes) // 1024
+            return f"IMAGE:{out_path}|Generated: {filename} ({sz} KB, {elapsed:.1f}s)\nPrompt: {prompt_text}"
+
+        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+            # Local server not running — fall back to remote
+            logging.getLogger("localcoder").info("Local image server not available, trying remote")
+
+        # Fallback: remote Replicate endpoint
+        try:
+            encoded = urllib.parse.quote(prompt_text)
+            gen_url = f"https://fast-flux-demo.replicate.workers.dev/api/generate-image?text={encoded}"
+            console.print(f"  [dim]Generating image (remote)…[/]")
+            r = subprocess.run(
+                [
+                    "curl", "-fsSL",
+                    "-H", "User-Agent: Mozilla/5.0",
+                    "-H", "Referer: https://fast-flux-demo.replicate.workers.dev/",
+                    "-o", out_path,
+                    gen_url,
+                ],
+                capture_output=True, timeout=30,
+            )
+            if r.returncode != 0:
+                return f"Error: image generation failed (curl rc={r.returncode}): {r.stderr.decode('utf-8', errors='replace')[:200]}"
+            if not os.path.isfile(out_path) or os.path.getsize(out_path) < 500:
+                return "Error: image generation returned empty or invalid response"
+            with open(out_path, "rb") as _f:
+                hdr = _f.read(8)
+            if not (hdr[:2] == b"\xff\xd8" or hdr[:4] == b"\x89PNG" or hdr[:4] == b"RIFF" or hdr[:4] == b"GIF8"):
+                os.unlink(out_path)
+                return "Error: server returned non-image response. Try: localfit serve-image klein-4b"
+            show_image_inline(out_path)
+            sz = os.path.getsize(out_path) // 1024
+            return f"IMAGE:{out_path}|Generated: {filename} ({sz} KB)\nPrompt: {prompt_text}"
+        except subprocess.TimeoutExpired:
+            return "Error: image generation timed out (30s). Try a simpler prompt."
+        except Exception as e:
+            return f"Error generating image: {e}"
     elif name == "read_pdf":
         path = args.get("path", "")
         full = os.path.join(CWD, path) if not os.path.isabs(path) else path
@@ -2421,7 +2911,73 @@ def exec_tool(name, args):
             except:
                 pass
 
-    return f"Unknown tool: {name}"
+    elif name == "preview_app":
+        path = args.get("path", "index.html")
+        full = os.path.join(CWD, path) if not os.path.isabs(path) else path
+        if not os.path.isfile(full):
+            return f"Error: file not found: {full}"
+
+        screenshot_path = os.path.join(CWD, ".localcoder-preview.png")
+        try:
+            import shutil as _prev_shutil
+
+            # Method 1: Use wkhtml if available (headless, no browser needed)
+            wk = _prev_shutil.which("wkhtmltoimage")
+            if wk:
+                r = subprocess.run(
+                    [wk, "--quality", "80", "--width", "1200", f"file://{full}", screenshot_path],
+                    capture_output=True, timeout=15,
+                )
+                if os.path.isfile(screenshot_path) and os.path.getsize(screenshot_path) > 500:
+                    show_image_inline(screenshot_path)
+                    return f"Preview screenshot saved. The page renders correctly at {path}"
+
+            # Method 2: Open in browser + use screencapture (macOS)
+            subprocess.Popen(["open", full], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(2)  # Wait for browser to render
+
+            # Take screenshot of the screen
+            r = subprocess.run(
+                ["screencapture", "-x", "-C", screenshot_path],
+                capture_output=True, timeout=10,
+            )
+            if os.path.isfile(screenshot_path) and os.path.getsize(screenshot_path) > 500:
+                show_image_inline(screenshot_path)
+                sz = os.path.getsize(screenshot_path) // 1024
+                return f"Preview: opened {path} in browser and captured screenshot ({sz}KB). Check the terminal image above — if something looks wrong, fix the code and preview again."
+
+            return f"Opened {path} in browser. Could not capture screenshot automatically."
+        except Exception as e:
+            return f"Preview: opened {path} in browser. Screenshot failed: {e}"
+
+    # Common E4B hallucinated tool names — redirect to real tools
+    TOOL_ALIASES = {
+        "generate_content": "generate_image",
+        "create_image": "generate_image",
+        "make_image": "generate_image",
+        "image_generate": "generate_image",
+        "create_file": "write_file",
+        "save_file": "write_file",
+        "run_command": "bash",
+        "shell": "bash",
+        "execute": "bash",
+        "search": "web_search",
+        "search_web": "web_search",
+        "open_browser": "preview_app",
+        "screenshot": "preview_app",
+        "view_page": "preview_app",
+    }
+    if name in TOOL_ALIASES:
+        real_name = TOOL_ALIASES[name]
+        logging.getLogger("localcoder").info(f"Tool alias: {name} → {real_name}")
+        return exec_tool(real_name, args)
+
+    # MCP tool dispatch — any tool starting with mcp__
+    mcp_mgr = get_mcp_manager()
+    if mcp_mgr.is_mcp_tool(name):
+        return mcp_mgr.call_tool(name, args)
+
+    return f"Error: Unknown tool '{name}'. Available tools: bash, write_file, read_file, edit_file, generate_image, preview_app, web_search, fetch_url"
 
 
 def estimate_tokens(text):
@@ -2454,80 +3010,27 @@ def summarize_tool_result(content, fname):
 
 
 def compress_messages(messages, max_tokens=12000):
-    """Claude-style context management:
-    1. Summarize tool results (keep structure, drop bulk)
-    2. Collapse old tool call pairs into summaries
-    3. Always keep: system, last user msg, recent context
+    """Smart context compression with structured compaction.
+
+    Uses LLM-based structured summarization (Goal/Discoveries/Accomplished/Files)
+    instead of naive 80-char truncation. Falls back gracefully if LLM call fails.
     """
     if not messages:
         return messages
 
-    system = messages[0]
-    rest = messages[1:]
-
-    # Pass 1: Truncate all tool results
-    for i, msg in enumerate(rest):
+    # First pass: truncate verbose tool results
+    for msg in messages[1:]:
         if isinstance(msg, dict) and msg.get("role") == "tool":
-            # Find which tool generated this
             fname = "unknown"
-            for j in range(i - 1, -1, -1):
-                prev = rest[j]
-                if hasattr(prev, "tool_calls") or (
-                    isinstance(prev, dict) and prev.get("tool_calls")
-                ):
-                    tc = (
-                        prev.get("tool_calls", [])
-                        if isinstance(prev, dict)
-                        else prev.tool_calls
-                    )
-                    if tc:
-                        fname = (
-                            tc[0].get("function", {}).get("name", "")
-                            if isinstance(tc[0], dict)
-                            else tc[0].function.name
-                        )
-                    break
             msg["content"] = summarize_tool_result(msg.get("content", ""), fname)
 
-    total = estimate_tokens(json.dumps([system] + rest))
+    total = estimate_tokens(json.dumps(messages))
     if total <= max_tokens:
-        return [system] + rest
+        return messages
 
-    # Pass 2: Collapse old assistant+tool pairs into summaries
-    # Keep last 4 messages intact, summarize the rest
-    if len(rest) > 6:
-        keep = rest[-6:]
-        old = rest[:-6]
-
-        # Summarize old turns into a single context message
-        summary_parts = []
-        for msg in old:
-            if isinstance(msg, dict):
-                role = msg.get("role", "")
-                if role == "user":
-                    summary_parts.append(f"User asked: {msg.get('content', '')[:80]}")
-                elif role == "assistant" and msg.get("content"):
-                    summary_parts.append(f"Agent responded: {msg['content'][:80]}")
-                elif role == "tool":
-                    summary_parts.append(
-                        f"Tool returned: {msg.get('content', '')[:40]}"
-                    )
-
-        if summary_parts:
-            summary = {
-                "role": "user",
-                "content": f"[Earlier in this conversation: {'; '.join(summary_parts[:5])}]",
-            }
-            rest = [summary] + keep
-        else:
-            rest = keep
-
-    total = estimate_tokens(json.dumps([system] + rest))
-    if total <= max_tokens:
-        return [system] + rest
-
-    # Pass 3: Emergency — keep only system + last 3
-    return [system] + rest[-3:]
+    # Delegate to structured compaction module
+    return smart_compress_messages(messages, max_tokens=max_tokens,
+                                   api_base=API_BASE, model=MODEL)
 
 
 def chat_api(messages, spinner=None):
@@ -2576,8 +3079,18 @@ def chat_api(messages, spinner=None):
     token_count = 0
     stream_started_at = time.time()
 
+    last_chunk_at = time.time()
+    idle_timeout = 180  # seconds — finalize partial args if LLM stalls
+
     with urllib.request.urlopen(req, timeout=300) as resp:
+        # Set socket timeout for idle detection
+        try:
+            resp.fp.raw._sock.settimeout(idle_timeout)
+        except Exception:
+            pass
+
         for raw_line in resp:
+            last_chunk_at = time.time()
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or line.startswith(":"):
                 continue
@@ -3089,7 +3602,10 @@ def show_response(text):
     console.print()
     try:
         if UI_LANG == "ar" or _contains_arabic(text):
-            console.print(Text(_display_text(text), style="white"), width=min(console.width - 4, 100))
+            console.print(
+                Text(_display_text(text), style="white"),
+                width=min(console.width - 4, 100),
+            )
         else:
             md = Markdown(text, code_theme="monokai")
             console.print(md, width=min(console.width - 4, 100))
@@ -3107,7 +3623,10 @@ def _auto_preview_images(text):
     img_urls = []
     img_urls += re.findall(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", text)
     img_urls += re.findall(r"\[[^\]]+\]\((https?://[^)\s]+)\)", text)
-    img_urls += re.findall(r"(https?://[^\s\)\]\"']+\.(?:png|jpg|jpeg|webp|gif|svg|bmp)(?:\?[^\s\)]*)?)", text)
+    img_urls += re.findall(
+        r"(https?://[^\s\)\]\"']+\.(?:png|jpg|jpeg|webp|gif|svg|bmp)(?:\?[^\s\)]*)?)",
+        text,
+    )
     img_urls += re.findall(r"(https?://[^\s\)\]\"']+)", text)
 
     seen = set()
@@ -3192,7 +3711,12 @@ def show_image_url(url, max_width=50, max_height=15, _depth=0):
                         html = f.read(120_000).decode("utf-8", errors="ignore")
                     nested = _extract_preview_image_url(url, html)
                     if nested and nested != url:
-                        return show_image_url(nested, max_width=max_width, max_height=max_height, _depth=_depth + 1)
+                        return show_image_url(
+                            nested,
+                            max_width=max_width,
+                            max_height=max_height,
+                            _depth=_depth + 1,
+                        )
                 except Exception:
                     pass
                 return False
@@ -3358,7 +3882,7 @@ class Permissions:
         self.approved = set()
         self._load_approved()
 
-    SAFE = {"read_file", "read_pdf", "web_search", "fetch_url"}
+    SAFE = {"read_file", "read_pdf", "web_search", "fetch_url", "generate_image"}
 
     def _config_path(self):
         return os.path.expanduser("~/.localcoder/approved_tools.json")
@@ -3414,6 +3938,13 @@ class Permissions:
         if self.mode == "auto" and fname in self.SAFE:
             return True
 
+        # Auto-approve safe bash commands (read-only, no side effects)
+        if self.mode == "auto" and fname == "bash" and args:
+            cmd = args.get("command", "")
+            safe, reason = is_safe_command(cmd)
+            if safe:
+                return True
+
         console.print(
             Panel(
                 f"[bold yellow]Allow [white]{fname}[/white]?[/]  [dim]y[/]es · [dim]n[/]o · [dim]a[/]lways",
@@ -3460,13 +3991,14 @@ class Permissions:
 
 
 # ── Agent loop ──
-def agent_loop(messages, perms):
+def agent_loop(messages, perms, session=None):
     total_tokens = 0
     loop_start = time.time()
     spinner = ThinkingSpinner(console)
     recent_tools = []
     self_corrected = False
-    for turn in range(25):
+    stream_idle_timeout = 180  # seconds — finalize partial args if LLM stalls
+    for turn in range(10):
         spinner.start()
         spinner.update(tokens=total_tokens)
         messages_for_call = messages
@@ -3490,18 +4022,35 @@ def agent_loop(messages, perms):
             ]
         try:
             resp = chat_api(messages_for_call, spinner=spinner)
-        except urllib.error.URLError:
+        except urllib.error.URLError as e:
             spinner.stop()
-            console.print(
-                "[bold red]  ✗ API timeout — context full. Auto-clearing old messages.[/]"
-            )
-            if len(messages) > 3:
-                messages[:] = [messages[0]] + messages[-2:]
+            err_str = str(e)
+            if "timed out" in err_str or "timeout" in err_str.lower():
+                console.print(
+                    "[bold red]  ✗ API timeout — context may be full. Auto-clearing old messages.[/]"
+                )
+                if len(messages) > 3:
+                    messages[:] = [messages[0]] + messages[-2:]
+                    continue
+            elif "Connection refused" in err_str:
+                console.print(
+                    "[bold red]  ✗ Server not running. Start it with: localcoder --setup[/]"
+                )
+            else:
+                console.print(f"[bold red]  ✗ Network error: {err_str[:200]}[/]")
+            break
+        except (json.JSONDecodeError, KeyError) as e:
+            spinner.stop()
+            logging.getLogger("localcoder").error(f"Malformed API response: {e}")
+            console.print(f"[bold red]  ✗ Bad API response — retrying...[/]")
+            if turn < 24:
+                time.sleep(1)
                 continue
             break
         except Exception as e:
             spinner.stop()
             console.print(f"[bold red]  ✗ {e}[/]")
+            logging.getLogger("localcoder").error(f"Agent loop error: {e}", exc_info=True)
             break
         finally:
             # Ensure spinner is always cleaned up before printing
@@ -3555,12 +4104,27 @@ def agent_loop(messages, perms):
             break
 
         messages.append(msg)
+        if session:
+            session.add_message(msg)
         for tc in msg["tool_calls"]:
             fname = tc["function"]["name"]
+            raw_args = tc["function"].get("arguments", "{}")
             try:
-                args = json.loads(tc["function"]["arguments"])
-            except:
-                args = {}
+                args = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                # Try to salvage partial JSON from stalled streams
+                try:
+                    # Common case: truncated string value — close it
+                    fixed = raw_args.rstrip()
+                    if fixed.count('"') % 2 == 1:
+                        fixed += '"'
+                    if not fixed.endswith("}"):
+                        fixed += "}"
+                    args = json.loads(fixed)
+                    logging.getLogger("localcoder").warning(f"Salvaged partial JSON for {fname}")
+                except Exception:
+                    args = {}
+                    logging.getLogger("localcoder").error(f"Unparseable args for {fname}: {raw_args[:200]}")
 
             # Loop detection — catch repeating patterns, then self-correct
             # Normalize: bash(cat file) counts as read_file(file)
@@ -3577,6 +4141,10 @@ def agent_loop(messages, perms):
             if not hasattr(agent_loop, "_error_count"):
                 agent_loop._error_count = 0
 
+            # Keep window bounded
+            if len(recent_tools) > 10:
+                recent_tools = recent_tools[-10:]
+
             if len(recent_tools) >= 3:
                 last3 = recent_tools[-3:]
                 is_loop = False
@@ -3584,6 +4152,9 @@ def agent_loop(messages, perms):
                     is_loop = True
                 # Catch alternating reads of same file (cat/read_file flip)
                 elif len(set(last3)) <= 2 and all(s.startswith("read:") for s in last3):
+                    is_loop = True
+                # Catch fetch loops (same URL fetched 3 times)
+                elif len(set(last3)) == 1 and last3[0].startswith("fetch:"):
                     is_loop = True
 
                 if is_loop:
@@ -3732,13 +4303,36 @@ def agent_loop(messages, perms):
                 if fname in ("fetch_url", "web_search")
                 else 1500
             )
-            messages.append(
-                {
+
+            # If result contains IMAGE:path, include base64 so the model can see it
+            result_str = str(result)[:max_len]
+            tool_content = result_str
+            if result_str.startswith("IMAGE:") and "|" in result_str:
+                img_path = result_str.split("IMAGE:", 1)[1].split("|", 1)[0]
+                if os.path.isfile(img_path):
+                    try:
+                        import base64 as _b64m
+                        img_b64 = _b64m.b64encode(open(img_path, "rb").read()).decode()
+                        # Detect mime type from extension
+                        ext = os.path.splitext(img_path)[1].lower()
+                        mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                                "webp": "image/webp", "gif": "image/gif"}.get(ext.lstrip("."), "image/png")
+                        text_part = result_str.split("|", 1)[1] if "|" in result_str else result_str
+                        tool_content = [
+                            {"type": "text", "text": text_part},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+                        ]
+                    except Exception:
+                        pass  # fall back to text-only
+
+            tool_msg = {
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": str(result)[:max_len],
+                    "content": tool_content,
                 }
-            )
+            messages.append(tool_msg)
+            if session:
+                session.add_message(tool_msg)
 
         tokens = usage.get("completion_tokens", 0) if usage else 0
         stats = Text()
@@ -4038,6 +4632,17 @@ def main(argv=None):
     parser.add_argument("-fr", "--french", action="store_true", help="French UI")
     parser.add_argument("--ask", action="store_true", help="Ask before every tool")
     parser.add_argument(
+        "--system",
+        type=str,
+        default=None,
+        help="Custom system prompt (string or path to .txt/.md file)",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Use compact system prompt (best for small models like E4B)",
+    )
+    parser.add_argument(
         "--api",
         type=str,
         default=None,
@@ -4049,6 +4654,9 @@ def main(argv=None):
     global MODEL, API_BASE, UI_LANG
     if args.model:
         MODEL = args.model
+        # Auto-set API base for Ollama models if not explicitly provided
+        if not args.api:
+            API_BASE = "http://127.0.0.1:11434/v1"
     if args.api:
         API_BASE = args.api
     if getattr(args, "arabic", False):
@@ -4097,41 +4705,78 @@ def main(argv=None):
     logger.info(f"=== Session started · model={MODEL} · cwd={CWD} · perms={mode} ===")
     perms = Permissions(mode, sandbox=sandbox)
 
-    system = {
-        "role": "system",
-        "content": f"You are Local Coder, an autonomous AI agent with coding AND computer use abilities. Working directory: {CWD}\n"
-        f"Platform: macOS. Today is {time.strftime('%B %d, %Y')}.\n"
-        f"ACT with tools. Never say 'I can\\'t'. Never give up.\n\n"
-        f"TOOL SELECTION:\n"
-        f"- CODING tasks (build apps, write code, edit files): use bash, write_file, read_file, edit_file\n"
-        f"- WEB SEARCH (find info, images, docs, APIs): use web_search tool. This is the DEFAULT for 'search', 'find', 'look up'.\n"
-        f"- For photo/image requests: first prefer direct image search results and REAL photos. Avoid portraits/headshots unless the user explicitly asked for them. Avoid logos, illustrations, thumbnails, Pinterest pages, AI-generated images, wallpapers, and article URLs pretending to be images.\n"
-        f"- If search only finds article links, call fetch_url on the article to extract lead images via Jina Reader / og:image, then return the direct image URL.\n"
-        f"- If user asks to show an image, return at least one DIRECT image URL that can be downloaded and previewed inline (jpg/png/webp/gif). Avoid webpage/gallery/share URLs unless you clearly label them as fallback links.\n"
-        f"- If the user only wants a photo or image, do NOT inspect app skills and do NOT build a gallery or web page. Just search and return the best direct image URL.\n"
-        f"- BROWSE A SPECIFIC WEBSITE: use computer_use ONLY when user says 'on [website]', 'open [url]', 'browse [site]'.\n"
-        f"  NOT a trigger: 'search for', 'find me', 'look up' — these use web_search.\n"
-        f"  HOW: computer_use action:open:https://THE_URL_HERE (opens Chrome directly)\n"
-        f"  After opening: take screenshot, read visible content, report to user.\n"
-        f"  You CAN browse any website. Never say you cannot access a site.\n"
-        f"- PDFs: use read_pdf tool\n"
-        f"- Images: download with bash curl (auto-displays in terminal)\n\n"
-        f"WHEN TO USE WHAT:\n"
-        f"- Static page (fan page, portfolio, gallery, landing): just write ONE index.html file. No server needed.\n"
-        f"- AI-powered app (analyzer, chatbot, scanner): use the 3-file pattern below (index.html + server.js + package.json).\n"
-        f"- NEVER build an Express server for a simple static page.\n\n"
-        f"APP SKILLS (pre-built templates you MUST use as baseline):\n"
-        f"Skills directory: {os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.agents', 'skills'))}\n"
-        f"When user asks to build an app, FIRST list ALL available skills and pick the closest:\n"
-        f"  1. bash: ls {os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.agents', 'skills'))}\n"
-        f"     (lists: quiz-game, flashcards, gallery, food-scanner, etc.)\n"
-        f"  2. Pick the CLOSEST matching skill. 'math quiz' → quiz-game. 'vocabulary' → flashcards. 'fan page' → gallery.\n"
-        f"  3. read_file the SKILL.md in that skill folder\n"
-        f"  3. read_file the assets/index.html template\n"
-        f"  4. write_file a customized copy to the user's project directory\n"
-        f"  5. Test the result\n"
-        f"NEVER generate complex HTML/SVG/CSS from scratch if a skill template exists.\n"
-        f"Use web_search to find images for galleries/fan pages.\n\n"
+    # ── Initialize MCP servers ──
+    mcp_mgr = init_mcp()
+    mcp_tools = mcp_mgr.get_tool_schemas()
+    # Don't inject MCP tool schemas into TOOLS for small models (E4B) —
+    # too many tools confuses them. MCP tools still work via exec_tool aliases.
+    is_small_model = any(tag in MODEL.lower() for tag in ("e4b", "e2b", "4b", "2b", "small"))
+    if mcp_tools and not is_small_model:
+        TOOLS.extend(mcp_tools)
+        mcp_names = [t["function"]["name"] for t in mcp_tools]
+        logger.info(f"MCP tools added: {', '.join(mcp_names)}")
+        for t in mcp_tools:
+            Permissions.SAFE.add(t["function"]["name"])
+    if mcp_tools:
+        console.print(f"  [dim]MCP: {len(mcp_tools)} tools from {len(mcp_mgr.servers)} server(s){' (aliased)' if is_small_model else ''}[/]")
+
+    _skills_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.agents', 'skills'))
+
+    # ── Custom system prompt from --system flag ──
+    if args.system:
+        custom = args.system
+        # If it's a file path, read it
+        if os.path.isfile(custom) or os.path.isfile(os.path.expanduser(custom)):
+            with open(os.path.expanduser(custom)) as f:
+                custom = f.read()
+        # Replace {CWD} placeholder
+        custom = custom.replace("{CWD}", CWD).replace("{SKILLS}", _skills_dir)
+        system = {"role": "system", "content": custom}
+    elif args.compact or is_small_model:
+        system = {
+            "role": "system",
+            "content": f"You are Local Coder, a coding agent. CWD: {CWD}\n"
+            f"RESPOND ONLY WITH TOOL CALLS. Never put code in chat text.\n\n"
+            f"TOOLS: generate_image, write_file, read_file, edit_file, bash, preview_app, web_search, fetch_url\n\n"
+            f"WORKFLOW:\n"
+            f"1. generate_image(prompt='detailed description', filename='name.png', size='256x256', steps=2) for each image\n"
+            f"2. write_file(path='index.html', content='complete HTML') with ALL code\n"
+            f"3. preview_app(path='index.html') to verify\n\n"
+            f"CSS: dark bg #0a0a14, cards rgba(255,255,255,0.04) blur(20px) rounded-24px, "
+            f"buttons gradient(135deg,#6366f1,#8b5cf6) rounded-14px, "
+            f"titles gradient(#f97316,#22c55e) bg-clip text, system-ui font, hover transitions.\n\n"
+            f"NEVER explain. NEVER plan. NEVER ask questions. Just call tools.",
+        }
+    else:
+        # ── Full system prompt for larger models (26B, 31B) ──
+        system = {
+            "role": "system",
+            "content": f"You are Local Coder, an autonomous AI coding agent. Working directory: {CWD}\n"
+            f"Platform: macOS. Date: {time.strftime('%B %d, %Y')}.\n"
+            f"You have tools. ALWAYS use tools to act. Never put code in chat — use write_file.\n\n"
+            f"YOUR WORKFLOW (follow this exact order):\n"
+        f"Step 1. GENERATE IMAGES FIRST — call generate_image for each image needed\n"
+        f"   generate_image(prompt='cute sleeping cat icon, kawaii, pastel pink', filename='cat-sleep.png', size='256x256', steps=2)\n"
+        f"   generate_image(prompt='playful dog icon, kawaii, pastel blue', filename='dog-play.png', size='256x256', steps=2)\n"
+        f"Step 2. WRITE CODE — call write_file with complete HTML referencing those images\n"
+        f"   write_file(path='index.html', content='<!DOCTYPE html>...<img src=\"cat-sleep.png\">...')\n"
+        f"Step 3. PREVIEW — call preview_app to see the result in the browser\n"
+        f"   preview_app(path='index.html')\n"
+        f"Step 4. FIX if needed — if preview shows issues, call edit_file to fix, then preview_app again\n\n"
+        f"IMAGES — MANDATORY:\n"
+        f"- ALWAYS call generate_image to create images. NEVER use placeholder URLs or stock photo sites.\n"
+        f"- Call generate_image BEFORE write_file (so the images exist when the page loads).\n"
+        f"- Use size='256x256' steps=2 for icons (fast ~4s). Use size='512x512' steps=4 for hero images.\n\n"
+        f"APP TEMPLATES (pre-built — ALWAYS check before building from scratch):\n"
+        f"Skills directory: {_skills_dir}\n"
+        f"  1. bash: ls {_skills_dir}\n"
+        f"  2. Pick closest match: 'math quiz' → quiz-game, 'vocabulary' → flashcards, 'fan page' → gallery\n"
+        f"  3. read_file the SKILL.md, then read_file assets/index.html\n"
+        f"  4. Customize with write_file. Generate images with generate_image. Preview with preview_app.\n\n"
+        f"ARCHITECTURE:\n"
+        f"- Landing page / gallery / portfolio → ONE index.html file. No server.\n"
+        f"- AI-powered app (chatbot, scanner) → 3 files: package.json + server.js + index.html\n"
+        f"  NEVER build Express for a simple static page.\n\n"
         f"WEB APP ARCHITECTURE (ONLY for AI-powered apps that need a backend):\n\n"
         f"APP STRUCTURE: Always 3 files in the SAME directory:\n"
         f"  package.json, server.js, index.html (all inline CSS+JS)\n"
@@ -4155,12 +4800,30 @@ def main(argv=None):
         f"    const data = await r.json();\n"
         f"    res.json({{analysis: data.choices[0].message.content}}); }});\n"
         f"  app.listen(3000);\n\n"
-        f"FRONTEND INDEX.HTML PATTERNS:\n"
-        f"- DESIGN: Dark theme bg:#0a0a14. Card: background:rgba(255,255,255,0.04); backdrop-filter:blur(20px); border:1px solid rgba(255,255,255,0.08); border-radius:24px.\n"
-        f"  Buttons: border-radius:14px; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; font-weight:600; padding:14px 28px.\n"
-        f"  Title: font-size:2rem; font-weight:700; background:linear-gradient(to right,#f97316,#22c55e); -webkit-background-clip:text; color:transparent.\n"
-        f"  Result area: background:rgba(255,255,255,0.03); border-left:3px solid #22c55e; border-radius:16px; padding:24px; white-space:pre-wrap.\n"
-        f"  Use system-ui font. Add transition:all 0.2s on buttons. Loading: spinner animation.\n\n"
+        f"DESIGN SYSTEM (copy these EXACT values for all pages):\n"
+        f"  COLORS: --bg:#0a0a14; --surface:rgba(255,255,255,0.04); --border:rgba(255,255,255,0.08); --text:#e2e8f0; --muted:#94a3b8; --accent:#8b5cf6; --accent2:#6366f1; --success:#22c55e; --warm:#f97316;\n"
+        f"  FONT: font-family:system-ui,-apple-system,sans-serif; base 16px; line-height:1.6;\n"
+        f"  SPACING: 0.5rem 1rem 1.5rem 2rem 3rem 4rem (use rem not px);\n"
+        f"  RADIUS: buttons 14px; cards 24px; inputs 12px; pills 9999px; icons 50%;\n"
+        f"  BODY: background:var(--bg); color:var(--text); min-height:100vh; padding:2rem; margin:0 auto; max-width:1200px;\n"
+        f"  CARD: background:var(--surface); backdrop-filter:blur(20px); border:1px solid var(--border); border-radius:24px; padding:2rem; transition:all 0.3s;\n"
+        f"  CARD:HOVER: transform:translateY(-8px); border-color:rgba(255,255,255,0.2); box-shadow:0 20px 40px rgba(0,0,0,0.3);\n"
+        f"  BUTTON: background:linear-gradient(135deg,var(--accent2),var(--accent)); color:white; font-weight:600; padding:14px 28px; border:none; border-radius:14px; cursor:pointer; transition:all 0.2s;\n"
+        f"  BUTTON:HOVER: transform:translateY(-2px) scale(1.02); box-shadow:0 8px 25px rgba(139,92,246,0.4);\n"
+        f"  TITLE: font-size:clamp(2rem,5vw,3.5rem); font-weight:800; background:linear-gradient(135deg,var(--warm),var(--success)); -webkit-background-clip:text; color:transparent;\n"
+        f"  SUBTITLE: color:var(--muted); font-size:1.15rem; max-width:600px; margin:0 auto 2rem;\n"
+        f"  GRID: display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:2rem;\n"
+        f"  INPUT: background:rgba(255,255,255,0.05); border:1px solid var(--border); border-radius:12px; padding:14px 18px; color:white; font-size:1rem; width:100%; transition:border-color 0.2s;\n"
+        f"  INPUT:FOCUS: border-color:var(--accent); outline:none; box-shadow:0 0 0 3px rgba(139,92,246,0.15);\n"
+        f"  HERO: text-align:center; padding:4rem 1rem 3rem;\n"
+        f"  NAV: display:flex; justify-content:space-between; align-items:center; padding:1rem 2rem; background:rgba(0,0,0,0.3); backdrop-filter:blur(10px); border-bottom:1px solid var(--border);\n"
+        f"  FOOTER: text-align:center; padding:2rem; color:var(--muted); border-top:1px solid var(--border); margin-top:auto;\n"
+        f"  BADGE: display:inline-block; padding:4px 12px; border-radius:9999px; font-size:0.8rem; background:rgba(139,92,246,0.15); color:var(--accent);\n"
+        f"  ICON-CIRCLE: width:80px; height:80px; border-radius:50%; border:3px solid var(--accent); padding:8px; object-fit:cover;\n"
+        f"  SECTION: padding:4rem 0; text-align:center;\n"
+        f"  STATS: display:flex; justify-content:center; gap:3rem; .stat-num font-size:2.5rem font-weight:800 color:var(--accent);\n"
+        f"  ANIMATION: @keyframes fadeUp{{from{{opacity:0;transform:translateY(20px)}}to{{opacity:1;transform:translateY(0)}}}} .fade-up{{animation:fadeUp 0.6s ease forwards}}\n"
+        f"  GLASS-EFFECT: background:rgba(255,255,255,0.03); backdrop-filter:blur(20px) saturate(180%); -webkit-backdrop-filter:blur(20px) saturate(180%);\n\n"
         f"- IMAGE UPLOAD (must use FileReader, never fake it):\n"
         f"  let imageBase64 = null;\n"
         f"  function uploadImage() {{\n"
@@ -4236,12 +4899,13 @@ def main(argv=None):
         f"- SVG pie/chart slices: use Math.cos(angle*Math.PI/180)*radius and Math.sin() for arc endpoints. Never approximate.\n"
         f"- Fetch to /api without server: static HTML files can't call /api. Use local JS logic or start Express.\n"
         f"- Missing CSS transitions: always add transition on hover/active states.\n\n"
-        f"RULES:\n"
-        f"- After reading a file ONCE, do NOT re-read it\n"
-        f"- Write complete code with write_file, not code blocks in chat\n"
-        f"- NEVER stop after writing files. Always test. Fix bugs. Test again.\n"
-        f"- Be concise. Do NOT narrate your plan before acting. Just call the tool directly.\n"
-        f"- Never say 'I will now...' or 'Let me...' — just do it.",
+        f"RULES (CRITICAL — follow strictly):\n"
+        f"- NEVER explain or narrate. NEVER ask for confirmation. NEVER say 'I will' or 'Let me'. Just call tools.\n"
+        f"- NEVER put code in chat messages. ALL code goes through write_file.\n"
+        f"- NEVER use placeholder image URLs. ALL images go through generate_image.\n"
+        f"- NEVER stop after generating images. ALWAYS continue to write_file then preview_app.\n"
+        f"- For EVERY user request: call tools immediately. No planning text. No questions. Just act.\n\n"
+        f"REMEMBER: You are an AGENT, not a chatbot. Your response should be TOOL CALLS, not text.",
     }
 
     # Add language instruction to system prompt for non-English UI
@@ -4249,8 +4913,16 @@ def main(argv=None):
     if _lang_instr:
         system["content"] = _lang_instr + "\n\n" + system["content"]
 
-    # Auto-detect running model + load saved preference
-    _load_last_model()
+    # Auto-detect running model + load saved preference (skip if user specified -m)
+    if not args.model:
+        _load_last_model()
+
+    # FORCE: if user passed -m, override everything — no auto-detect can change this
+    if args.model:
+        MODEL = args.model
+        if not args.api:
+            API_BASE = "http://127.0.0.1:11434/v1"
+        logger.info(f"Model forced by -m flag: {MODEL} @ {API_BASE}")
 
     show_banner()
 
@@ -4275,12 +4947,18 @@ def main(argv=None):
                 )
                 _save_config(iterm_rtl_hint_shown=True)
 
+    # Initialize session persistence
+    _session = Session(cwd=CWD, model=MODEL)
+    logger.info(f"Session: {_session.session_id}")
+
     # One-shot mode
     if args.prompt:
         console.print(_render_user_turn(args.prompt))
         console.print()
         messages = [system, {"role": "user", "content": args.prompt}]
-        agent_loop(messages, perms)
+        _session.add_message(system)
+        _session.add_message({"role": "user", "content": args.prompt})
+        agent_loop(messages, perms, session=_session)
         return
 
     # Interactive mode
@@ -4313,24 +4991,46 @@ def main(argv=None):
     total_tokens = 0
     history_file = os.path.join(CWD, ".localcoder-history.json")
 
-    # --continue: restore last session
+    # --continue: restore last session (try JSONL first, then legacy JSON)
     if args.cont:
+        loaded = False
         try:
-            with open(history_file) as f:
-                messages = json.load(f)
-            n = len(
-                [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
-            )
-            console.print(
-                f"  [green]{_ui(f'✦ Resumed session ({n} messages)', f'✦ استئناف الجلسة ({n} رسائل)', f'✦ Session restaurée ({n} messages)')}[/]"
-            )
-        except:
-            console.print(
-                f"  [dim]{_ui('No saved session — starting fresh', 'لا توجد جلسة محفوظة — بداية جديدة', 'Pas de session sauvegardée — nouveau départ')}[/]"
-            )
-            messages = [system]
+            last_id = get_latest_session_id()
+            if last_id:
+                prev_session, prev_cwd, prev_model = Session.load(last_id)
+                messages = prev_session.get_messages_for_continuation()
+                if messages:
+                    # Re-wrap with current session (new ID, preserves old history)
+                    for msg in messages:
+                        _session.add_message(msg)
+                    n = len([m for m in messages if isinstance(m, dict) and m.get("role") == "user"])
+                    console.print(
+                        f"  [green]{_ui(f'✦ Resumed session ({n} messages)', f'✦ استئناف الجلسة ({n} رسائل)', f'✦ Session restaurée ({n} messages)')}[/]"
+                    )
+                    loaded = True
+        except Exception as e:
+            logger.warning(f"JSONL session load failed: {e}")
+
+        if not loaded:
+            # Legacy fallback: old JSON history
+            try:
+                with open(history_file) as f:
+                    messages = json.load(f)
+                n = len([m for m in messages if isinstance(m, dict) and m.get("role") == "user"])
+                console.print(
+                    f"  [green]{_ui(f'✦ Resumed session ({n} messages)', f'✦ استئناف الجلسة ({n} رسائل)', f'✦ Session restaurée ({n} messages)')}[/]"
+                )
+                for msg in messages:
+                    _session.add_message(msg)
+            except Exception:
+                console.print(
+                    f"  [dim]{_ui('No saved session — starting fresh', 'لا توجد جلسة محفوظة — بداية جديدة', 'Pas de session sauvegardée — nouveau départ')}[/]"
+                )
+                messages = [system]
+                _session.add_message(system)
     else:
         messages = [system]
+        _session.add_message(system)
 
     # Clipboard image state + voice state
     _clipboard_image_path = [None]
@@ -4593,7 +5293,17 @@ def main(argv=None):
             ]
             # Stronger decoding improves Arabic/non-English recognition.
             if _voice_lang in ("ar", "fr", "es", "de", "ja", "zh"):
-                whisper_cmd.extend(["--beam-size", "8", "--best-of", "8", "--temperature", "0", "--no-fallback"])
+                whisper_cmd.extend(
+                    [
+                        "--beam-size",
+                        "8",
+                        "--best-of",
+                        "8",
+                        "--temperature",
+                        "0",
+                        "--no-fallback",
+                    ]
+                )
             if _voice_lang == "ar":
                 whisper_cmd.extend(
                     [
@@ -4729,6 +5439,9 @@ def main(argv=None):
         "/log": "View debug log",
         "/think": "Toggle reasoning: none → low → medium → high",
         "/deploy": "Generate & deploy an AI-powered React app",
+        "/handoff": "Generate a focused prompt for a new session",
+        "/sessions": "List recent sessions",
+        "/mcp": "Show MCP servers and tools",
         "/exit": "Exit",
     }
 
@@ -5185,6 +5898,35 @@ def main(argv=None):
         if task == "/deploy" or task.startswith("/deploy "):
             _handle_deploy(task, messages, perms, system, console)
             continue
+        if task == "/handoff":
+            _handle_handoff(messages, console)
+            continue
+        if task == "/mcp":
+            mgr = get_mcp_manager()
+            if not mgr.servers:
+                console.print("  [dim]No MCP servers configured.[/]")
+                console.print(f"  [dim]Add servers to ~/.localcoder/mcp.json[/]")
+                console.print(f'  [dim]Example: {{"servers": {{"localfit-image": {{"command": "python3", "args": ["-m", "localfit.mcp_image"]}}}}}}[/]')
+            else:
+                for name, server in mgr.servers.items():
+                    running = server.process and server.process.poll() is None
+                    status = "[green]running[/]" if running else "[red]stopped[/]"
+                    console.print(f"  [bold]{name}[/] {status}")
+                    for tool_name, tool_def in server.tools.items():
+                        desc = tool_def.get("description", "")[:60]
+                        console.print(f"    [cyan]mcp__{name}__{tool_name}[/] — [dim]{desc}[/]")
+            continue
+        if task == "/sessions":
+            sessions_list = list_sessions(limit=10)
+            if sessions_list:
+                for s in sessions_list:
+                    console.print(
+                        f"  [cyan]{s['id']}[/]  {s['messages']} msgs  "
+                        f"[dim]{s['started']}  {s['model']}  {s['size_kb']}KB[/]"
+                    )
+            else:
+                console.print("  [dim]No sessions yet[/]")
+            continue
 
         # Handle clipboard image if pasted
         clip_img = _clipboard_image_path[0]
@@ -5200,14 +5942,15 @@ def main(argv=None):
             sz_kb = os.path.getsize(saved_path) // 1024
             # Clean up the "[📎 image]" prefix from prompt
             task = task.replace("[📎 image]", "").strip() or "What is in this image?"
-            console.print(_render_user_turn(task, note=f"attached {saved_name} ({sz_kb} KB)"))
+            console.print(
+                _render_user_turn(task, note=f"attached {saved_name} ({sz_kb} KB)")
+            )
             # Show image inline AFTER prompt (now we're in normal terminal mode)
             show_image_inline(saved_path)
             console.print(
                 f"  [green]📎[/] [dim]{saved_name}[/] [dim green]({sz_kb} KB)[/]\n"
             )
-            messages.append(
-                {
+            img_msg = {
                     "role": "user",
                     "content": [
                         {
@@ -5220,18 +5963,23 @@ def main(argv=None):
                         },
                     ],
                 }
-            )
+            messages.append(img_msg)
+            _session.add_message(img_msg)
         else:
             console.print(_render_user_turn(task))
             console.print()
-            messages.append({"role": "user", "content": task})
+            user_msg = {"role": "user", "content": task}
+            messages.append(user_msg)
+            _session.add_message(user_msg)
 
         try:
-            tokens = agent_loop(messages, perms)
+            tokens = agent_loop(messages, perms, session=_session)
             total_tokens += tokens
         except KeyboardInterrupt:
             console.print(f"\n  [bold yellow]⚡ Interrupted[/]")
+            _session.add_event("interrupt")
 
+        # Legacy save (for old -c continue fallback)
         try:
             safe = [m for m in messages if isinstance(m, dict)]
             with open(history_file, "w") as f:
@@ -5241,6 +5989,109 @@ def main(argv=None):
 
     # ── Exit: offer memory cleanup ──
     _cleanup_on_exit()
+
+
+def _handle_handoff(messages, console):
+    """Generate a focused opening prompt for a new session.
+
+    Sends the current conversation to the LLM with a structured handoff template,
+    then copies the result to clipboard. Inspired by kon's /handoff command.
+    """
+    console.print("  [dim]Generating handoff prompt...[/]")
+
+    # Build condensed conversation for the handoff call
+    conv_parts = []
+    files_seen = set()
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if role == "user" and content:
+            conv_parts.append(f"User: {content[:300]}")
+        elif role == "assistant":
+            tool_calls = msg.get("tool_calls", [])
+            for tc in tool_calls:
+                fname = tc.get("function", {}).get("name", "")
+                try:
+                    tc_args = json.loads(tc["function"].get("arguments", "{}"))
+                except Exception:
+                    tc_args = {}
+                if fname in ("write_file", "edit_file", "read_file"):
+                    files_seen.add(tc_args.get("path", ""))
+            if content:
+                conv_parts.append(f"Assistant: {content[:200]}")
+        elif role == "tool" and content:
+            conv_parts.append(f"Tool: {content[:100]}")
+
+    conversation_text = "\n".join(conv_parts[-30:])  # Last 30 entries
+
+    handoff_prompt = f"""Based on this conversation, generate a focused opening prompt for a NEW session.
+The prompt should give the new session everything it needs to continue the work.
+
+Use this format:
+## Task
+What needs to be done (1-2 sentences).
+
+## Context
+Key background (what was built, what approach was taken, what works).
+
+## Relevant Files
+{chr(10).join(f'- {f}' for f in sorted(files_seen) if f) or '(list the key files)'}
+
+## Constraints
+Any rules, preferences, or gotchas discovered.
+
+## Next Steps
+What specifically to do next (bullet list, be actionable).
+
+Conversation:
+{conversation_text[:6000]}"""
+
+    try:
+        body = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": "Generate a focused handoff prompt. Be specific and actionable."},
+                {"role": "user", "content": handoff_prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1024,
+            "stream": False,
+        }
+        payload = json.dumps(body).encode()
+        req = urllib.request.Request(
+            f"{API_BASE}/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+            handoff = data["choices"][0]["message"]["content"].strip()
+
+        # Copy to clipboard
+        try:
+            proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            proc.communicate(handoff.encode())
+            console.print(f"\n  [green]Handoff prompt copied to clipboard.[/]")
+        except Exception:
+            pass
+
+        # Also display it
+        console.print(Panel(
+            Markdown(handoff),
+            title="[bold cyan]Handoff Prompt[/]",
+            border_style="cyan",
+            padding=(1, 2),
+            width=min(90, console.width - 4),
+        ))
+        console.print(f"  [dim]Paste this into a new session to continue.[/]\n")
+
+    except Exception as e:
+        console.print(f"  [red]Handoff failed: {e}[/]")
 
 
 def _handle_deploy(task, messages, perms, system, console):

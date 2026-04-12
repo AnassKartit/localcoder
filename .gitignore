@@ -18,3 +18,23 @@ build/
 *.egg-info/
 __pycache__/
 .pytest_cache/
+
+# Generated images/media
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.wav
+*.mp3
+
+# Test artifacts
+.localcoder-preview.png
+.localcoder-voice.wav
+.localcoder.log
+localcoder_finetune.jsonl
+
+# Finetune outputs
+localcoder-e4b-gguf/
+localcoder-e4b-lora/
+Modelfile

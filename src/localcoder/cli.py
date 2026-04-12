@@ -277,7 +277,10 @@ def _apply_session_font_overrides(ui_lang):
             _emit_iterm2_set_profile(LOCALCODER_ITERM2_AR_PROFILE)
 
             def _restore_iterm():
-                if previous_profile and previous_profile != LOCALCODER_ITERM2_AR_PROFILE:
+                if (
+                    previous_profile
+                    and previous_profile != LOCALCODER_ITERM2_AR_PROFILE
+                ):
                     _emit_iterm2_set_profile(previous_profile)
 
             return _restore_iterm
@@ -502,6 +505,8 @@ def main():
     parser.add_argument("--yolo", action="store_true", help="Auto-approve everything")
     parser.add_argument("--bypass", action="store_true", help="Same as --yolo")
     parser.add_argument("--ask", action="store_true", help="Ask before every tool")
+    parser.add_argument("--compact", action="store_true", help="Compact system prompt (best for small models)")
+    parser.add_argument("--system", type=str, default=None, help="Custom system prompt (string or path to file)")
     parser.add_argument("--api", type=str, default=None, help="API base URL")
     parser.add_argument("--setup", action="store_true", help="Run setup wizard")
     parser.add_argument("--models", action="store_true", help="List and select models")
@@ -909,11 +914,17 @@ def main():
         import urllib.request
 
         api_base = args.api.rstrip("/")
-        health_url = f"{api_base}/health"
-        try:
-            urllib.request.urlopen(health_url, timeout=3)
-        except Exception:
-            console.print(f"  [red]Server not reachable at {health_url}[/]")
+        # Try /health (llama-server) first, then root (Ollama)
+        reachable = False
+        for health_url in [f"{api_base}/health", api_base.replace("/v1", "")]:
+            try:
+                urllib.request.urlopen(health_url, timeout=3)
+                reachable = True
+                break
+            except Exception:
+                continue
+        if not reachable:
+            console.print(f"  [red]Server not reachable at {api_base}[/]")
             console.print(f"  [dim]Start it first: localfit --serve <model>[/]")
             return
         # Build minimal config from CLI args
