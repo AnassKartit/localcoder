@@ -41,3 +41,4 @@ Modelfile
 src/localcoder/finetune/dataset.py
 src/localcoder/finetune/*.ipynb
 *.jsonl
+src/localcoder/finetune/
