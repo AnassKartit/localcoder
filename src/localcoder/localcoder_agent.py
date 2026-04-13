@@ -2,6 +2,7 @@
 """localcoder — Claude Code-style CLI agent powered by local models."""
 
 import os, subprocess, sys, json, urllib.request, urllib.parse, time, re, argparse, logging, signal, threading, random
+from html import escape as html_escape, unescape as html_unescape
 
 from localcoder.agent_session import Session, get_latest_session_id, list_sessions
 from localcoder.compaction import compress_messages as smart_compress_messages
@@ -9,6 +10,7 @@ from localcoder.safe_commands import is_safe_command, classify_command
 from localcoder.mcp_client import init_mcp, get_mcp_manager
 
 from rich import box
+from rich.align import Align
 from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -164,6 +166,95 @@ _IMAGE_GOOD_HINTS = (
     "fifa",
     "uefa",
 )
+_SMALL_MODEL_TAGS = ("e4b", "e2b", "4b", "2b", "small")
+_BUILTIN_TOOL_NAMES = {
+    "bash",
+    "write_file",
+    "read_file",
+    "edit_file",
+    "generate_image",
+    "preview_app",
+    "web_search",
+    "fetch_url",
+}
+_VISUAL_COUNT_HINTS = {
+    "1": 1,
+    "one": 1,
+    "a": 1,
+    "an": 1,
+    "2": 2,
+    "two": 2,
+    "3": 3,
+    "three": 3,
+    "4": 4,
+    "four": 4,
+    "5": 5,
+    "five": 5,
+}
+_VISUAL_NOUNS = (
+    "image",
+    "images",
+    "photo",
+    "photos",
+    "picture",
+    "pictures",
+    "icon",
+    "icons",
+    "illustration",
+    "illustrations",
+    "logo",
+    "logos",
+    "portrait",
+    "portraits",
+    "hero image",
+    "hero images",
+)
+_VISUAL_PAGE_HINTS = (
+    "landing page",
+    "homepage",
+    "home page",
+    "bio page",
+    "biography",
+    "timeline",
+    "fan page",
+    "portfolio",
+    "gallery",
+    "showcase",
+    "about page",
+)
+_UI_BUILD_HINTS = (
+    "landing page",
+    "homepage",
+    "home page",
+    "page",
+    "website",
+    "site",
+    "web app",
+    "frontend",
+    "ui",
+    "design",
+    "redesign",
+    "theme",
+    "style",
+    "layout",
+    "editorial",
+    "wikipedia",
+    "article",
+    "html",
+    "portfolio",
+    "gallery",
+    "dashboard",
+)
+
+_FRONTEND_DESIGN_NOTE = (
+    "The latest user request is a frontend design task. "
+    "Act like a strong product designer, not a generic coder. "
+    "Match the user's visual direction exactly and do not fall back to black/purple glassmorphism unless they asked for it. "
+    "Choose one clear design language and execute it decisively. "
+    "For editorial or Wikipedia-like pages: use a light reading surface, dark text, restrained accent colors, strong type hierarchy, readable article width, an infobox/sidebar, section dividers, captions, and source styling. "
+    "When the user asks for white/light, do not hedge back toward dark mode. "
+    "Do not narrate options or plans. Read the file, rewrite the layout/CSS with conviction, then preview."
+)
 
 
 def _clean_image_search_query(query):
@@ -261,6 +352,267 @@ def _is_image_only_request(text):
         )
     )
     return has_image_intent and not has_build_intent
+
+
+def _is_small_model_name(model_name=None):
+    name = (model_name or MODEL or "").lower()
+    return any(tag in name for tag in _SMALL_MODEL_TAGS)
+
+
+def _latest_user_text(messages):
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            return msg.get("content", "")
+    return ""
+
+
+def _request_may_build_ui(text):
+    lower = (text or "").lower()
+    return any(hint in lower for hint in _UI_BUILD_HINTS)
+
+
+def _request_benefits_from_visual(text):
+    lower = (text or "").lower()
+    return any(hint in lower for hint in _VISUAL_PAGE_HINTS)
+
+
+def _request_wants_visuals(text):
+    lower = (text or "").lower()
+    return any(noun in lower for noun in _VISUAL_NOUNS)
+
+
+def _request_prefers_real_photo(text):
+    lower = (text or "").lower()
+    if any(
+        keyword in lower
+        for keyword in (
+            "logo",
+            "logos",
+            "icon",
+            "icons",
+            "illustration",
+            "illustrations",
+            "mascot",
+            "anime",
+            "cartoon",
+            "kawaii",
+            "fictional",
+        )
+    ):
+        return False
+    return any(
+        keyword in lower
+        for keyword in ("bio", "biography", "timeline", "history", "about", "profile")
+    )
+
+
+def _visual_budget_for_request(text):
+    lower = (text or "").lower()
+    if any(
+        phrase in lower
+        for phrase in (
+            "text only",
+            "text-only",
+            "no image",
+            "no images",
+            "without images",
+        )
+    ):
+        return 0
+    for hint, count in sorted(
+        _VISUAL_COUNT_HINTS.items(), key=lambda item: -len(item[0])
+    ):
+        for noun in _VISUAL_NOUNS:
+            if re.search(rf"\b{re.escape(hint)}\s+{re.escape(noun)}\b", lower):
+                return count
+    if _request_wants_visuals(lower):
+        return (
+            2
+            if any(noun.endswith("s") and noun in lower for noun in _VISUAL_NOUNS)
+            else 1
+        )
+    if _request_benefits_from_visual(lower):
+        return 1
+    return 0
+
+
+def _tool_name(tool_def):
+    return tool_def.get("function", {}).get("name", "")
+
+
+def _normalize_tool_signature(fname, args):
+    args = args or {}
+    if fname == "bash" and args.get("command", "").startswith("cat "):
+        return f"read:{args['command'].split()[-1]}"
+    if fname == "read_file":
+        return f"read:{args.get('path', '')}"
+    if fname == "write_file":
+        return f"write:{args.get('path', '')}"
+    if fname == "edit_file":
+        return f"edit:{args.get('path', '')}"
+    if fname == "preview_app":
+        return f"preview:{args.get('path', '')}"
+    if fname == "fetch_url":
+        return f"fetch:{args.get('url', '')[:80]}"
+    if fname == "web_search":
+        query = re.sub(r"\s+", " ", args.get("query", "")).strip().lower()
+        return f"search:{query[:80]}"
+    if fname == "generate_image":
+        prompt = re.sub(r"\s+", " ", args.get("prompt", "")).strip().lower()
+        return f"image:{prompt[:80]}"
+    return f"{fname}:{json.dumps(args, sort_keys=True)[:80]}"
+
+
+def _consecutive_tool_kind(recent_tools, prefix):
+    count = 0
+    for sig in reversed(recent_tools or []):
+        if sig.startswith(prefix):
+            count += 1
+            continue
+        break
+    return count
+
+
+def _detect_tool_loop(recent_tools):
+    if len(recent_tools) < 3:
+        return None
+    last3 = recent_tools[-3:]
+    if last3[0] == last3[1] == last3[2]:
+        if last3[0].startswith("read:"):
+            return "read"
+        if last3[0].startswith("fetch:"):
+            return "fetch"
+        if last3[0].startswith("image:"):
+            return "image"
+        if last3[0].startswith("preview:"):
+            return "preview"
+        return "repeat"
+    if len(set(last3)) <= 2 and all(sig.startswith("read:") for sig in last3):
+        return "read"
+    if all(sig.startswith("image:") for sig in last3):
+        return "image"
+    if len(recent_tools) >= 4 and all(
+        sig.startswith("preview:") for sig in recent_tools[-4:]
+    ):
+        return "preview"
+    return None
+
+
+def _loop_feedback(kind):
+    if kind == "read":
+        return (
+            "LOOP DETECTED: STOP reading the same file. You already have enough context. "
+            "Next action: write_file/edit_file if you are building, or answer directly if the task is done."
+        )
+    if kind == "fetch":
+        return (
+            "LOOP DETECTED: STOP fetching the same URL. Reuse the data you already have. "
+            "Next action: write the output, edit the file, or answer."
+        )
+    if kind == "image":
+        return (
+            "LOOP DETECTED: STOP generating more images. Reuse the visuals you already have unless the user explicitly asked for additional distinct assets. "
+            "Next action: write_file/edit_file, then preview_app."
+        )
+    if kind == "preview":
+        return (
+            "LOOP DETECTED: STOP previewing repeatedly without editing. "
+            "Next action: edit_file/write_file to fix the page, or answer if the page is already good."
+        )
+    return (
+        "LOOP DETECTED: STOP repeating the same tool call. "
+        "Choose the next highest-value action and move forward."
+    )
+
+
+def _fallback_web_search(query, max_results=5):
+    encoded = urllib.parse.quote(query)
+    req = urllib.request.Request(
+        f"https://duckduckgo.com/html/?q={encoded}",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+    matches = re.findall(
+        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    formatted = []
+    for href, title_html in matches[:max_results]:
+        title = re.sub(r"<[^>]+>", "", title_html)
+        title = html_unescape(title).strip()
+        formatted.append(f"[{title}]({href})")
+    return formatted
+
+
+def _select_tools_for_turn(messages, recent_tools=None):
+    recent_tools = recent_tools or []
+    last_user_text = _latest_user_text(messages)
+    is_small = _is_small_model_name()
+    allowed = set(_BUILTIN_TOOL_NAMES)
+    visual_budget = _visual_budget_for_request(last_user_text)
+    image_calls = sum(1 for sig in recent_tools if sig.startswith("image:"))
+    preview_streak = _consecutive_tool_kind(recent_tools, "preview:")
+    real_photo_request = _request_prefers_real_photo(last_user_text)
+
+    if real_photo_request:
+        # Real biographies/timelines should use real photos via web_search/fetch_url,
+        # not locally generated lookalikes.
+        allowed.discard("generate_image")
+
+    if is_small:
+        allowed.discard("generate_image")
+        allowed.discard("preview_app")
+
+        if (
+            "preview" in (last_user_text or "").lower()
+            or "screenshot" in (last_user_text or "").lower()
+            or any(
+                sig.startswith(("write:", "edit:", "preview:")) for sig in recent_tools
+            )
+        ):
+            allowed.add("preview_app")
+
+        if (
+            not real_photo_request
+            and visual_budget > 0
+            and not (
+                _request_prefers_real_photo(last_user_text)
+                and not any(
+                    sig.startswith(("search:", "fetch:")) for sig in recent_tools
+                )
+            )
+        ):
+            allowed.add("generate_image")
+
+        if (
+            visual_budget == 0
+            and _is_image_only_request(last_user_text)
+            and not real_photo_request
+        ):
+            allowed.add("generate_image")
+
+        if visual_budget > 0 and image_calls >= visual_budget:
+            allowed.discard("generate_image")
+
+        if preview_streak >= 2:
+            allowed.discard("preview_app")
+    else:
+        if (
+            not real_photo_request
+            and visual_budget > 0
+            and image_calls >= max(visual_budget, 1)
+        ):
+            allowed.discard("generate_image")
+        if preview_streak >= 3:
+            allowed.discard("preview_app")
+
+    return [
+        tool
+        for tool in TOOLS
+        if _tool_name(tool) not in _BUILTIN_TOOL_NAMES or _tool_name(tool) in allowed
+    ]
 
 
 def _rank_image_candidate(url, title="", source=""):
@@ -569,90 +921,423 @@ MODEL = os.environ.get("GEMMA_MODEL", "gemma4-26b")
 # Vision model (UI-TARS) for screenshot grounding — separate from brain model
 VISION_API_BASE = os.environ.get("VISION_API_BASE", "")  # e.g. http://127.0.0.1:8090/v1
 VISION_MODEL = os.environ.get("VISION_MODEL", "")  # e.g. UI-TARS-1.5-7B
-CWD = os.getcwd()
+ROOT_CWD = os.getcwd()
+CWD = ROOT_CWD
 REASONING_EFFORT = "medium"  # none, low, medium, high — toggle with /think
+_INTERRUPTED_CONTINUE_NOTE = (
+    "The previous assistant turn was interrupted by the user. "
+    "Continue from the current context and completed tool results. "
+    "Do not repeat finished work or restart already-running servers unless a health check fails."
+)
+_PROJECT_ARTIFACTS_DIRNAME = ".localcoder-artifacts"
+_PROJECT_CREATE_HINTS = (
+    "build",
+    "create",
+    "make",
+    "generate",
+    "scaffold",
+    "start a new",
+    "new project",
+)
+_PROJECT_NOUN_HINTS = (
+    "app",
+    "site",
+    "website",
+    "landing page",
+    "page",
+    "dashboard",
+    "portfolio",
+    "gallery",
+    "tool",
+    "script",
+    "agent",
+    "api",
+    "service",
+    "game",
+    "quiz",
+    "project",
+)
+_PROJECT_SKIP_HINTS = (
+    "fix ",
+    "debug ",
+    "edit ",
+    "update ",
+    "change ",
+    "modify ",
+    "continue ",
+    "resume ",
+    "tui",
+    "terminal launch",
+    "localcoder",
+    "pyproject",
+    "readme",
+    ".py",
+    ".js",
+    ".ts",
+    ".html",
+)
+_PROJECT_SLUG_STOPWORDS = {
+    "a",
+    "an",
+    "app",
+    "application",
+    "build",
+    "create",
+    "for",
+    "generate",
+    "landing",
+    "make",
+    "new",
+    "page",
+    "project",
+    "site",
+    "the",
+    "tool",
+    "website",
+}
+
+
+def _detached_popen_kwargs():
+    kwargs = {"stdin": subprocess.DEVNULL}
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _spawn_background_process(cmd, **kwargs):
+    """Start a child process that survives Ctrl+C in the parent TUI."""
+    popen_kwargs = _detached_popen_kwargs()
+    popen_kwargs.update(kwargs)
+    return subprocess.Popen(cmd, **popen_kwargs)
+
+
+def _persist_interrupted_turn(messages, msg, session=None):
+    """Keep partial assistant output so the next user turn can continue from it."""
+    assistant_msg = {
+        "role": "assistant",
+        "content": msg.get("content", ""),
+        "interrupted": True,
+    }
+    if msg.get("reasoning_content"):
+        assistant_msg["reasoning_content"] = msg["reasoning_content"]
+
+    if assistant_msg["content"] or assistant_msg.get("reasoning_content"):
+        messages.append(assistant_msg)
+        if session:
+            session.add_message(assistant_msg)
+
+    note = {"role": "system", "content": _INTERRUPTED_CONTINUE_NOTE}
+    if not messages or messages[-1] != note:
+        messages.append(note)
+        if session:
+            session.add_message(note)
+
+
+def _get_git_branch(cwd):
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if result.returncode == 0:
+            branch = result.stdout.strip()
+            if branch and branch != "HEAD":
+                return branch
+    except Exception:
+        pass
+    return ""
+
+
+def _launch_banner_lines(cwd, backend_info, model_label, gpu_str="", swap_str=""):
+    branch = _get_git_branch(cwd)
+    ctx = backend_info.get("ctx") or "?"
+    backend = backend_info.get("backend", "unknown")
+    gpu_ok = backend_info.get("gpu")
+    status_dot = "[green]●[/]" if gpu_ok else "[yellow]●[/]"
+    cwd_name = os.path.basename(cwd.rstrip(os.sep)) or cwd
+    if len(cwd_name) > 28:
+        cwd_name = f"{cwd_name[:25]}..."
+    if len(model_label) > 28:
+        model_label = f"{model_label[:25]}..."
+    cwd_line = f"[dim]{cwd_name}[/]"
+    if branch:
+        cwd_line += f" [cyan]({branch})[/]"
+
+    line1 = (
+        "[bold #f5f5f5]localcoder[/]"
+        f" [dim]•[/] [bold #e5c07b]{backend}[/]"
+        f" [dim]•[/] [#d4d4d8]{model_label}[/]"
+    )
+
+    line2_parts = [cwd_line, f"{status_dot} [dim]{ctx} ctx[/]"]
+    if gpu_str:
+        line2_parts.append(gpu_str)
+    if swap_str:
+        line2_parts.append(swap_str)
+    line2 = f" [dim]•[/] ".join(line2_parts)
+
+    line3 = (
+        "[dim]shift+enter[/] new line  [dim]•[/] "
+        "[dim]/continue[/] resume  [dim]•[/] "
+        "[dim]/models[/] switch  [dim]•[/] "
+        "[dim]?[/] help"
+    )
+    return [line1, line2, line3]
+
+
+def _resolve_remote_api_key(cli_key=None):
+    return (
+        cli_key
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("AZURE_OPENAI_API_KEY")
+        or os.environ.get("AZURE_AI_API_KEY")
+        or os.environ.get("FOUNDRY_API_KEY")
+        or os.environ.get("LOCALCODER_API_KEY")
+        or ""
+    )
+
+
+def _set_workspace_cwd(path):
+    global CWD, SNAPSHOT_DIR
+    CWD = os.path.abspath(path)
+    SNAPSHOT_DIR = os.path.join(CWD, ".localcoder-snapshots")
+    return CWD
+
+
+def _request_needs_artifact_workspace(text):
+    lower = (text or "").strip().lower()
+    if not lower or _is_image_only_request(lower):
+        return False
+    if any(hint in lower for hint in _PROJECT_SKIP_HINTS):
+        return False
+    has_create = any(hint in lower for hint in _PROJECT_CREATE_HINTS)
+    has_target = any(
+        hint in lower for hint in _PROJECT_NOUN_HINTS
+    ) or _request_may_build_ui(lower)
+    return has_create and has_target
+
+
+def _project_slug_from_prompt(text):
+    lower = (text or "").lower()
+    named_match = re.search(
+        r"(?:called|named)\s+['\"]?([a-z0-9][a-z0-9\s_-]{2,50})", lower
+    )
+    source = named_match.group(1) if named_match else lower
+    tokens = re.findall(r"[a-z0-9]+", source)
+    filtered = [token for token in tokens if token not in _PROJECT_SLUG_STOPWORDS]
+    chosen = (filtered or tokens or ["project"])[:6]
+    slug = "-".join(chosen).strip("-")
+    return slug or "project"
+
+
+def _project_tree_text(path):
+    lines = [f"{os.path.basename(path)}/"]
+    try:
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            suffix = "/" if os.path.isdir(full) else ""
+            lines.append(f"  - {name}{suffix}")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+def _workspace_context_message(path, created=False):
+    rel = os.path.relpath(path, ROOT_CWD)
+    intro = (
+        "Created a dedicated project artifact workspace for this request."
+        if created
+        else "Resume work inside the existing project artifact workspace."
+    )
+    return {
+        "role": "system",
+        "content": (
+            f"{intro}\n"
+            f"Workspace root: {path}\n"
+            f"Relative path: {rel}\n"
+            f"Project tree:\n{_project_tree_text(path)}\n"
+            "All relative file paths now resolve inside this workspace, not the repo root. "
+            "Put generated images/media under assets/ unless a better folder is clearly needed."
+        ),
+    }
+
+
+def _prepare_project_artifact_workspace(prompt_text, session=None):
+    if CWD != ROOT_CWD or not _request_needs_artifact_workspace(prompt_text):
+        return None
+
+    artifacts_root = os.path.join(ROOT_CWD, _PROJECT_ARTIFACTS_DIRNAME)
+    os.makedirs(artifacts_root, exist_ok=True)
+
+    slug = _project_slug_from_prompt(prompt_text)
+    workspace = os.path.join(artifacts_root, slug)
+    suffix = 2
+    while os.path.exists(workspace):
+        workspace = os.path.join(artifacts_root, f"{slug}-{suffix}")
+        suffix += 1
+
+    os.makedirs(workspace, exist_ok=True)
+    os.makedirs(os.path.join(workspace, "assets"), exist_ok=True)
+    _set_workspace_cwd(workspace)
+
+    if session:
+        session.add_event(
+            "workspace",
+            {
+                "cwd": CWD,
+                "root_cwd": ROOT_CWD,
+                "relative_path": os.path.relpath(CWD, ROOT_CWD),
+            },
+        )
+
+    return _workspace_context_message(CWD, created=True)
 
 
 # ── Backend detection ──
 def detect_backend():
-    """Auto-detect backend type and model info from the API server."""
+    """Auto-detect backend type and model info from running servers."""
     info = {
         "backend": "unknown",
         "model_name": MODEL,
         "quant": "",
         "size": "",
+        "size_gb": 0,
         "ctx": "",
+        "gpu": False,
     }
-    try:
-        # Check if it's Ollama (has /api/tags)
-        if "11434" in API_BASE:
-            info["backend"] = "Ollama"
-        else:
-            info["backend"] = "llama.cpp"
 
-        # Get model list from /models endpoint
-        req = urllib.request.Request(
-            f"{API_BASE}/models", headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read())
-        models = data.get("data", [])
-        if models:
-            # Prefer the model matching what the user selected (MODEL),
-            # otherwise fall back to the first model in the list
-            m = models[0]
-            mid = m.get("id", MODEL)
-            for candidate in models:
-                cid = candidate.get("id", "")
-                if MODEL.lower().replace(":", "-").replace("_", "") in cid.lower().replace(":", "-").replace("_", ""):
-                    mid = cid
-                    m = candidate
-                    break
-            info["model_name"] = mid
+    # ── Check if using a remote API (Modal, OpenRouter, etc.) ──
+    is_remote = not any(
+        local in API_BASE for local in ["127.0.0.1", "localhost", "0.0.0.0"]
+    )
+    if is_remote:
+        info["backend"] = "Remote"
+        info["model_name"] = MODEL
+        info["gpu"] = True
+        # Try to get model list from remote
+        try:
+            _api_key = _resolve_remote_api_key()
+            req = urllib.request.Request(
+                f"{API_BASE}/models",
+                headers={"Content-Type": "application/json"},
+            )
+            if _api_key:
+                req.add_header("Authorization", f"Bearer {_api_key}")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+            models = data.get("data", [])
+            if models:
+                # Use the model matching MODEL, or first available
+                for m in models:
+                    if MODEL in m.get("id", ""):
+                        info["model_name"] = m["id"]
+                        break
+                else:
+                    info["model_name"] = models[0].get("id", MODEL)
+            info["ctx"] = "128K"  # remote typically has large context
+        except Exception:
+            pass
+        return info
 
-            # Parse quant from model ID (e.g. "gemma-4-26B-A4B-it-UD-Q3_K_XL")
-            for q in [
-                "Q2_K",
-                "Q3_K_S",
-                "Q3_K_M",
-                "Q3_K_L",
-                "Q3_K_XL",
-                "Q4_K_S",
-                "Q4_K_M",
-                "Q4_K_XL",
-                "Q5_K_M",
-                "Q6_K",
-                "Q8_0",
-                "BF16",
-                "F16",
-                "IQ3_S",
-                "IQ4_XS",
-            ]:
-                if q.lower().replace("_", "") in mid.lower().replace("_", "").replace(
-                    "-", ""
-                ):
-                    info["quant"] = q
-                    break
+    # ── Try configured API first ──
+    _found = False
+    for _api in [API_BASE, "http://127.0.0.1:8089/v1", "http://127.0.0.1:11434/v1"]:
+        if _found:
+            break
+        try:
+            if "11434" in _api:
+                info["backend"] = "Ollama"
+            else:
+                info["backend"] = "llama.cpp"
 
-            # Parse model size
-            for s in [
-                "e2b",
-                "e4b",
-                "26b",
-                "27b",
-                "31b",
-                "12b",
-                "8b",
-                "4b",
-                "2b",
-                "1b",
-                "70b",
-            ]:
-                if s in mid.lower().replace("-", ""):
-                    info["size"] = s.upper()
-                    break
+            req = urllib.request.Request(
+                f"{_api}/models", headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read())
+            models = data.get("data", [])
+            if models:
+                m = models[0]
+                mid = m.get("id", MODEL)
+                for candidate in models:
+                    cid = candidate.get("id", "")
+                    if MODEL.lower().replace(":", "-").replace(
+                        "_", ""
+                    ) in cid.lower().replace(":", "-").replace("_", ""):
+                        mid = cid
+                        m = candidate
+                        break
+                info["model_name"] = mid
+                _found = True
 
-        # Try to get context size from /props or /health
+                # Parse quant from model ID
+                for q in [
+                    "Q2_K",
+                    "Q3_K_S",
+                    "Q3_K_M",
+                    "Q3_K_L",
+                    "Q3_K_XL",
+                    "Q4_K_S",
+                    "Q4_K_M",
+                    "Q4_K_XL",
+                    "Q5_K_M",
+                    "Q6_K",
+                    "Q8_0",
+                    "BF16",
+                    "F16",
+                    "IQ3_S",
+                    "IQ4_XS",
+                    "IQ4_NL",
+                ]:
+                    if q.lower().replace("_", "") in mid.lower().replace(
+                        "_", ""
+                    ).replace("-", ""):
+                        info["quant"] = q
+                        break
+
+                # Parse model size
+                for s in [
+                    "e2b",
+                    "e4b",
+                    "26b",
+                    "27b",
+                    "31b",
+                    "12b",
+                    "8b",
+                    "4b",
+                    "2b",
+                    "1b",
+                    "70b",
+                ]:
+                    if s in mid.lower().replace("-", ""):
+                        info["size"] = s.upper()
+                        break
+
+        except Exception:
+            continue
+
+    # ── Also check Ollama /api/ps for GPU-loaded models ──
+    if not _found:
+        try:
+            _or = urllib.request.urlopen("http://127.0.0.1:11434/api/ps", timeout=2)
+            _od = json.loads(_or.read())
+            if _od.get("models"):
+                _om = _od["models"][0]
+                info["model_name"] = _om.get("name", MODEL)
+                info["backend"] = "Ollama"
+                info["size_gb"] = _om.get("size", 0) / (1024**3)
+                info["gpu"] = True
+                _found = True
+        except Exception:
+            pass
+
+    # ── Get context size ──
+    if _found:
         try:
             req2 = urllib.request.Request(
                 f"{API_BASE.replace('/v1', '')}/props",
@@ -672,11 +1357,22 @@ def detect_backend():
                     info["ctx"] = "16K"
                 else:
                     info["ctx"] = f"{ctx // 1024}K"
-        except:
+        except Exception:
             pass
 
-    except:
+    # ── GPU detection ──
+    try:
+        from localcoder.backends import get_metal_gpu_stats
+
+        metal = get_metal_gpu_stats()
+        gt = metal.get("total_mb", 0)
+        if gt > 0:
+            info["gpu"] = True
+            info["gpu_total_mb"] = gt
+            info["gpu_alloc_mb"] = metal.get("alloc_mb", 0)
+    except Exception:
         pass
+
     return info
 
 
@@ -991,7 +1687,11 @@ def _switch_model(new_model, new_url):
         cmd += ["--no-mmproj"]
 
     console.print(f"  [dim]Starting server...[/]")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = _spawn_background_process(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
     # Wait for ready
     ready = False
@@ -1533,7 +2233,12 @@ TOOLS = [
             "description": "Run a shell command and return stdout+stderr. Use for: installing packages (npm install), running servers (node server.js &), testing (curl), git, and any system command.",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute",
+                    }
+                },
                 "required": ["command"],
             },
         },
@@ -1546,8 +2251,14 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path relative to CWD (e.g. 'index.html', 'server.js')"},
-                    "content": {"type": "string", "description": "Complete file content to write"},
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to CWD (e.g. 'index.html', 'server.js')",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Complete file content to write",
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -1585,7 +2296,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "generate_image",
-            "description": "Generate an image from a text prompt using local AI (Flux). Saves the image to disk and displays it in the terminal. Call this BEFORE write_file when building pages that need images. Example: generate_image(prompt='cute cat icon, kawaii, flat design', filename='cat.png')",
+            "description": "Generate an image from a text prompt using local AI (Flux). Use this only when the page truly needs a new visual asset or the user asked for AI-generated imagery. For real people, places, or products, prefer web_search/fetch_url to find a real photo. Default: 256x256 + 2 steps (~5s). Example: generate_image(prompt='cute cat icon, kawaii, flat design', filename='cat.png')",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1599,11 +2310,11 @@ TOOLS = [
                     },
                     "size": {
                         "type": "string",
-                        "description": "Image size WxH. Use 256x256 for icons, 512x512 for medium, 1024x1024 for large. Default: 512x512",
+                        "description": "Image size WxH. 256x256=fast default (~5s), 512x512=medium (~20s), 1024x1024=large (~60s). Default: 256x256",
                     },
                     "steps": {
                         "type": "integer",
-                        "description": "Quality steps. 2=fast, 4=good, 8=best. Default: 4",
+                        "description": "Quality steps. 2=fast default (~5s), 4=good, 8=best. Default: 2",
                     },
                 },
                 "required": ["prompt", "filename"],
@@ -1614,7 +2325,24 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "preview_app",
-            "description": "Open an HTML file in the browser, take a screenshot, and display it in the terminal. Use this AFTER writing an HTML file to verify it looks correct. If something looks wrong, fix it and preview again.",
+            "description": "Open an HTML file in the browser, take a screenshot, and return that screenshot to the model for visual self-evaluation. Use this AFTER writing or editing HTML so you can inspect the actual rendered UI and fix what looks wrong.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the HTML file to preview (e.g. 'index.html')",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "screenshot_app",
+            "description": "Take a screenshot of an HTML page and give that screenshot back to the model as vision input so it can evaluate its own frontend design.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1631,7 +2359,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web via DuckDuckGo. Use for finding info, docs, APIs. Do NOT use for finding images — use generate_image instead.",
+            "description": "Search the web via DuckDuckGo. Use for facts, docs, APIs, and finding real-world photos or official reference pages when the subject is a real person, place, product, or event.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
@@ -1660,7 +2388,10 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to PDF file"},
-                    "pages": {"type": "string", "description": "Page range: 'all', '1-3', '2,5'. Default: first 5"},
+                    "pages": {
+                        "type": "string",
+                        "description": "Page range: 'all', '1-3', '2,5'. Default: first 5",
+                    },
                 },
                 "required": ["path"],
             },
@@ -1761,10 +2492,27 @@ def exec_tool(name, args):
                     1,
                 )
         # Longer timeout for server starts and installs
-        cmd_timeout = 120 if any(k in cmd for k in ("npm install", "pip install", "node server", "python3 -m http")) else 60
+        cmd_timeout = (
+            120
+            if any(
+                k in cmd
+                for k in (
+                    "npm install",
+                    "pip install",
+                    "node server",
+                    "python3 -m http",
+                )
+            )
+            else 60
+        )
         try:
             r = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, cwd=CWD, timeout=cmd_timeout
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=CWD,
+                timeout=cmd_timeout,
             )
             output = (r.stdout + r.stderr).strip()
             if not output:
@@ -1790,7 +2538,9 @@ def exec_tool(name, args):
         content = args.get("content", "")
         # Auto-fix empty path — guess from content
         if not path or path.endswith("/"):
-            if content.strip().startswith("<!DOCTYPE") or content.strip().startswith("<html"):
+            if content.strip().startswith("<!DOCTYPE") or content.strip().startswith(
+                "<html"
+            ):
                 path = "index.html"
             elif content.strip().startswith("{"):
                 path = "data.json"
@@ -1798,7 +2548,9 @@ def exec_tool(name, args):
                 path = "server.js"
             else:
                 path = "output.txt"
-            logging.getLogger("localcoder").warning(f"write_file: empty path, auto-assigned '{path}'")
+            logging.getLogger("localcoder").warning(
+                f"write_file: empty path, auto-assigned '{path}'"
+            )
         full = os.path.join(CWD, path) if not os.path.isabs(path) else path
         if os.path.isdir(full):
             return f"Error: '{path}' is a directory, not a file. Provide a filename like '{path}index.html'"
@@ -1818,13 +2570,9 @@ def exec_tool(name, args):
         full = os.path.join(CWD, path) if not os.path.isabs(path) else path
         with open(full) as f:
             content = f.read()
-        # Strip HTML for .html files to save context
+        # Keep raw HTML so edit_file can target exact markup later.
         if path.endswith(".html") and "<html" in content[:200].lower():
-            text = re.sub(r"<script[^>]*>.*?</script>", "", content, flags=re.DOTALL)
-            text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
-            text = re.sub(r"<[^>]+>", " ", text)
-            text = re.sub(r"\s+", " ", text).strip()
-            return text[:3000]
+            return content[:8000]
         return content[:5000]
     elif name == "edit_file":
         path = args.get("path", "")
@@ -1833,7 +2581,10 @@ def exec_tool(name, args):
             content = f.read()
         old = args.get("old_text", "")
         if old not in content:
-            return "Error: old_text not found"
+            return (
+                "Error: old_text not found. "
+                "Use read_file to grab the exact current text, or use write_file to rewrite the full file if the target section is too brittle for edit_file."
+            )
         snapshot_file(path)  # backup before edit
         new_content = content.replace(old, args.get("new_text", ""), 1)
         with open(full, "w") as f:
@@ -2062,7 +2813,16 @@ def exec_tool(name, args):
                 else f"No results for '{query}'"
             )
         except ImportError:
-            return f"Search requires 'ddgs' package. Install: pip install ddgs"
+            try:
+                formatted = _fallback_web_search(query, max_results=5)
+                if formatted:
+                    return f"Search results for '{query}':\n\n" + "\n\n".join(formatted)
+            except Exception:
+                pass
+            return (
+                f"Search requires 'ddgs' package. Install with: "
+                f"{sys.executable} -m pip install ddgs"
+            )
         except Exception as e:
             return f"Search error: {e}"
     elif name == "computer_use":
@@ -2385,7 +3145,11 @@ def exec_tool(name, args):
                 )
                 vision_resp = urllib.request.urlopen(vision_req, timeout=90)
                 vision_r = json.loads(vision_resp.read())
-                vision_msg = vision_r["choices"][0]["message"]
+                vision_msg = (
+                    vision_r.get("choices", [{}])[0].get("message", {})
+                    if vision_r.get("choices")
+                    else {}
+                )
                 screen_desc = vision_msg.get("content", "") or vision_msg.get(
                     "reasoning_content", ""
                 )
@@ -2721,25 +3485,34 @@ finished(content='xxx')
     elif name == "generate_image":
         prompt_text = args.get("prompt", "")
         filename = args.get("filename", "generated-image.png")
-        size = args.get("size", "512x512")
-        steps = args.get("steps", 4)
+        size = args.get("size", "256x256")
+        steps = args.get("steps", 2)
         if not prompt_text:
             return "Error: prompt is required"
-        if not any(filename.lower().endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp")):
+        if not any(
+            filename.lower().endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp")
+        ):
             filename += ".png"
         out_path = os.path.join(CWD, filename)
 
         # Try local image server first (localfit at :8189)
-        local_endpoint = os.environ.get("LOCALFIT_IMAGE_ENDPOINT", "http://127.0.0.1:8189")
+        local_endpoint = os.environ.get(
+            "LOCALFIT_IMAGE_ENDPOINT", "http://127.0.0.1:8189"
+        )
         try:
             import base64 as _b64gen
-            payload = json.dumps({"prompt": prompt_text, "size": size, "steps": steps}).encode()
+
+            payload = json.dumps(
+                {"prompt": prompt_text, "size": size, "steps": steps}
+            ).encode()
             req = urllib.request.Request(
                 f"{local_endpoint}/v1/images/generations",
                 data=payload,
                 headers={"Content-Type": "application/json"},
             )
-            console.print(f"  [dim]Generating image locally ({size}, {steps} steps)…[/]")
+            console.print(
+                f"  [dim]Generating image locally ({size}, {steps} steps)…[/]"
+            )
             t0 = time.time()
             with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read())
@@ -2759,38 +3532,164 @@ finished(content='xxx')
             return f"IMAGE:{out_path}|Generated: {filename} ({sz} KB, {elapsed:.1f}s)\nPrompt: {prompt_text}"
 
         except (urllib.error.URLError, ConnectionRefusedError, OSError):
-            # Local server not running — fall back to remote
-            logging.getLogger("localcoder").info("Local image server not available, trying remote")
-
-        # Fallback: remote Replicate endpoint
-        try:
-            encoded = urllib.parse.quote(prompt_text)
-            gen_url = f"https://fast-flux-demo.replicate.workers.dev/api/generate-image?text={encoded}"
-            console.print(f"  [dim]Generating image (remote)…[/]")
-            r = subprocess.run(
-                [
-                    "curl", "-fsSL",
-                    "-H", "User-Agent: Mozilla/5.0",
-                    "-H", "Referer: https://fast-flux-demo.replicate.workers.dev/",
-                    "-o", out_path,
-                    gen_url,
-                ],
-                capture_output=True, timeout=30,
+            # Auto-start image server — zero config
+            console.print(
+                f"  [yellow]Image server not running — auto-starting klein-4b...[/]"
             )
-            if r.returncode != 0:
-                return f"Error: image generation failed (curl rc={r.returncode}): {r.stderr.decode('utf-8', errors='replace')[:200]}"
-            if not os.path.isfile(out_path) or os.path.getsize(out_path) < 500:
-                return "Error: image generation returned empty or invalid response"
-            with open(out_path, "rb") as _f:
-                hdr = _f.read(8)
-            if not (hdr[:2] == b"\xff\xd8" or hdr[:4] == b"\x89PNG" or hdr[:4] == b"RIFF" or hdr[:4] == b"GIF8"):
-                os.unlink(out_path)
-                return "Error: server returned non-image response. Try: localfit serve-image klein-4b"
-            show_image_inline(out_path)
-            sz = os.path.getsize(out_path) // 1024
-            return f"IMAGE:{out_path}|Generated: {filename} ({sz} KB)\nPrompt: {prompt_text}"
-        except subprocess.TimeoutExpired:
-            return "Error: image generation timed out (30s). Try a simpler prompt."
+            _img_started = False
+
+            # Kill any stale/broken image server first
+            try:
+                subprocess.run(
+                    ["pkill", "-f", "localfit.image_server"],
+                    capture_output=True,
+                    timeout=5,
+                )
+                time.sleep(1)
+            except Exception:
+                pass
+
+            try:
+                import shutil as _ish
+
+                # Find localfit's Python — not localcoder's pipx venv
+                _img_cmd = None
+                _lf_bin = _ish.which("localfit")
+                if _lf_bin:
+                    # Read shebang to find localfit's Python interpreter
+                    try:
+                        with open(_lf_bin, "r") as _f:
+                            _shebang = _f.readline().strip()
+                            if _shebang.startswith("#!") and "python" in _shebang:
+                                _lf_py = _shebang[2:].strip()
+                                if os.path.isfile(_lf_py):
+                                    _img_cmd = [
+                                        _lf_py,
+                                        "-m",
+                                        "localfit.image_server",
+                                        "8189",
+                                        "klein-4b",
+                                        "4",
+                                    ]
+                    except Exception:
+                        pass
+
+                if not _img_cmd:
+                    # Fallback: try system python
+                    for _py in [
+                        "/opt/homebrew/bin/python3",
+                        "/usr/local/bin/python3",
+                        sys.executable,
+                    ]:
+                        if os.path.isfile(_py):
+                            _img_cmd = [
+                                _py,
+                                "-m",
+                                "localfit.image_server",
+                                "8189",
+                                "klein-4b",
+                                "4",
+                            ]
+                            break
+
+                if not _img_cmd:
+                    _img_cmd = [
+                        sys.executable,
+                        "-m",
+                        "localfit.image_server",
+                        "8189",
+                        "klein-4b",
+                        "4",
+                    ]
+
+                console.print(f"  [dim]Starting image server...[/]")
+                _img_proc = _spawn_background_process(
+                    _img_cmd,
+                    stdout=None,  # Show loading progress to user
+                    stderr=subprocess.STDOUT,
+                )
+
+                # Wait for server AND model to be FULLY loaded
+                console.print(
+                    f"  [dim]Loading model (first run downloads weights)...[/]"
+                )
+                for _iw in range(90):
+                    time.sleep(2)
+                    # Check process is still alive
+                    if _img_proc.poll() is not None:
+                        console.print(
+                            f"  [red]Image server exited (code {_img_proc.returncode})[/]"
+                        )
+                        import platform as _plat
+
+                        if _plat.system() == "Darwin":
+                            console.print(f"  [dim]Fix: pipx inject localfit mflux[/]")
+                        else:
+                            console.print(
+                                f"  [dim]Fix: pipx inject localfit diffusers torch[/]"
+                            )
+                        break
+                    try:
+                        _ihr = urllib.request.urlopen(
+                            "http://127.0.0.1:8189/health", timeout=2
+                        )
+                        _ihd = json.loads(_ihr.read())
+                        _im = _ihd.get("model", "")
+                        # Must have status ok AND a real model name loaded
+                        if _ihd.get("status") == "ok" and _im and _im != "not loaded":
+                            _img_started = True
+                            console.print(f"  [green]✓[/] Image server ready — {_im}")
+                            break
+                    except urllib.error.HTTPError:
+                        # 503 = still loading, keep waiting
+                        if _iw > 0 and _iw % 5 == 0:
+                            console.print(f"  [dim]Still loading... ({_iw * 2}s)[/]")
+                    except Exception:
+                        if _iw > 0 and _iw % 10 == 0:
+                            console.print(
+                                f"  [dim]Waiting for server... ({_iw * 2}s)[/]"
+                            )
+            except Exception as _ie:
+                logging.getLogger("localcoder").debug(f"Image auto-start failed: {_ie}")
+
+            if _img_started:
+                # Retry the generation
+                try:
+                    console.print(
+                        f"  [dim]Generating image ({size}, {steps} steps)…[/]"
+                    )
+                    t0 = time.time()
+                    import base64 as _b64retry
+
+                    payload2 = json.dumps(
+                        {"prompt": prompt_text, "size": size, "steps": steps}
+                    ).encode()
+                    req2 = urllib.request.Request(
+                        f"{local_endpoint}/v1/images/generations",
+                        data=payload2,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(req2, timeout=300) as resp2:
+                        result2 = json.loads(resp2.read())
+                    elapsed = time.time() - t0
+                    if "error" in result2:
+                        return f"Error: {result2['error'].get('message', 'unknown')}"
+                    b64 = result2["data"][0]["b64_json"]
+                    img_bytes = _b64retry.b64decode(b64)
+                    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                    with open(out_path, "wb") as f:
+                        f.write(img_bytes)
+                    show_image_inline(out_path)
+                    sz = len(img_bytes) // 1024
+                    return f"IMAGE:{out_path}|Generated: {filename} ({sz} KB, {elapsed:.1f}s)\nPrompt: {prompt_text}"
+                except Exception as _re:
+                    return f"Error generating image after auto-start: {_re}"
+            else:
+                return (
+                    "Error: Could not auto-start image server.\n"
+                    "Install localfit: pip install localfit\n"
+                    "Then: python -m localfit.image_server 8189 klein-4b 4"
+                )
         except Exception as e:
             return f"Error generating image: {e}"
     elif name == "read_pdf":
@@ -2911,7 +3810,7 @@ finished(content='xxx')
             except:
                 pass
 
-    elif name == "preview_app":
+    elif name in ("preview_app", "screenshot_app"):
         path = args.get("path", "index.html")
         full = os.path.join(CWD, path) if not os.path.isabs(path) else path
         if not os.path.isfile(full):
@@ -2925,28 +3824,55 @@ finished(content='xxx')
             wk = _prev_shutil.which("wkhtmltoimage")
             if wk:
                 r = subprocess.run(
-                    [wk, "--quality", "80", "--width", "1200", f"file://{full}", screenshot_path],
-                    capture_output=True, timeout=15,
+                    [
+                        wk,
+                        "--quality",
+                        "80",
+                        "--width",
+                        "1200",
+                        f"file://{full}",
+                        screenshot_path,
+                    ],
+                    capture_output=True,
+                    timeout=15,
                 )
-                if os.path.isfile(screenshot_path) and os.path.getsize(screenshot_path) > 500:
+                if (
+                    os.path.isfile(screenshot_path)
+                    and os.path.getsize(screenshot_path) > 500
+                ):
                     show_image_inline(screenshot_path)
-                    return f"Preview screenshot saved. The page renders correctly at {path}"
+                    sz = os.path.getsize(screenshot_path) // 1024
+                    return (
+                        f"IMAGE:{screenshot_path}|Preview screenshot captured for {path} "
+                        f"({sz}KB). Inspect the rendered UI visually and decide whether to edit it."
+                    )
 
             # Method 2: Open in browser + use screencapture (macOS)
-            subprocess.Popen(["open", full], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(
+                ["open", full], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
             time.sleep(2)  # Wait for browser to render
 
             # Take screenshot of the screen
             r = subprocess.run(
                 ["screencapture", "-x", "-C", screenshot_path],
-                capture_output=True, timeout=10,
+                capture_output=True,
+                timeout=10,
             )
-            if os.path.isfile(screenshot_path) and os.path.getsize(screenshot_path) > 500:
+            if (
+                os.path.isfile(screenshot_path)
+                and os.path.getsize(screenshot_path) > 500
+            ):
                 show_image_inline(screenshot_path)
                 sz = os.path.getsize(screenshot_path) // 1024
-                return f"Preview: opened {path} in browser and captured screenshot ({sz}KB). Check the terminal image above — if something looks wrong, fix the code and preview again."
+                return (
+                    f"IMAGE:{screenshot_path}|Preview screenshot captured for {path} "
+                    f"({sz}KB). Inspect the rendered UI visually and decide whether to edit it."
+                )
 
-            return f"Opened {path} in browser. Could not capture screenshot automatically."
+            return (
+                f"Opened {path} in browser. Could not capture screenshot automatically."
+            )
         except Exception as e:
             return f"Preview: opened {path} in browser. Screenshot failed: {e}"
 
@@ -2965,6 +3891,10 @@ finished(content='xxx')
         "search_web": "web_search",
         "open_browser": "preview_app",
         "screenshot": "preview_app",
+        "screenshot_app": "preview_app",
+        "take_screenshot": "preview_app",
+        "inspect_app": "preview_app",
+        "evaluate_ui": "preview_app",
         "view_page": "preview_app",
     }
     if name in TOOL_ALIASES:
@@ -3029,11 +3959,12 @@ def compress_messages(messages, max_tokens=12000):
         return messages
 
     # Delegate to structured compaction module
-    return smart_compress_messages(messages, max_tokens=max_tokens,
-                                   api_base=API_BASE, model=MODEL)
+    return smart_compress_messages(
+        messages, max_tokens=max_tokens, api_base=API_BASE, model=MODEL
+    )
 
 
-def chat_api(messages, spinner=None):
+def chat_api(messages, spinner=None, tools=None):
     """Call the LLM API with streaming.
 
     Streams text content live to console, accumulates tool calls.
@@ -3051,12 +3982,15 @@ def chat_api(messages, spinner=None):
             f"API call: {len(messages)} msgs, ~{tokens_est} tokens"
         )
 
+    selected_tools = TOOLS if tools is None else tools
+    is_small_model = _is_small_model_name()
+    buffer_text_until_done = is_small_model
     body = {
         "model": MODEL,
         "messages": messages,
-        "tools": TOOLS,
-        "temperature": 1.0,
-        "top_p": 0.95,
+        "tools": selected_tools,
+        "temperature": 0.2 if is_small_model else 0.7,
+        "top_p": 0.9 if is_small_model else 0.95,
         "stream": True,
     }
     if REASONING_EFFORT != "medium":
@@ -3067,6 +4001,10 @@ def chat_api(messages, spinner=None):
         data=payload,
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
+    # Add auth header for remote APIs (Modal, OpenRouter, etc.)
+    _api_key = _resolve_remote_api_key()
+    if _api_key:
+        req.add_header("Authorization", f"Bearer {_api_key}")
 
     content_parts = []
     reasoning_parts = []
@@ -3089,96 +4027,131 @@ def chat_api(messages, spinner=None):
         except Exception:
             pass
 
-        for raw_line in resp:
-            last_chunk_at = time.time()
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line or line.startswith(":"):
-                continue
-            if line == "data: [DONE]":
-                break
-            if not line.startswith("data: "):
-                continue
-            try:
-                chunk = json.loads(line[6:])
-            except json.JSONDecodeError:
-                continue
+        try:
+            for raw_line in resp:
+                last_chunk_at = time.time()
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line == "data: [DONE]":
+                    break
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    chunk = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
 
-            delta = chunk.get("choices", [{}])[0].get("delta", {})
-            finish_reason = (
-                chunk.get("choices", [{}])[0].get("finish_reason") or finish_reason
-            )
-            model_name = chunk.get("model", model_name)
+                delta = (
+                    (chunk.get("choices", [{}])[0].get("delta") or {})
+                    if chunk.get("choices")
+                    else {}
+                )
+                finish_reason = (
+                    (
+                        chunk.get("choices", [{}])[0].get("finish_reason")
+                        or finish_reason
+                    )
+                    if chunk.get("choices")
+                    else finish_reason
+                )
+                model_name = chunk.get("model", model_name)
 
-            # Usage info (llama.cpp sends it in the last chunk)
-            if chunk.get("usage"):
-                usage = chunk["usage"]
-            if chunk.get("timings"):
-                timings = chunk["timings"]
+                # Usage info (llama.cpp sends it in the last chunk)
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                if chunk.get("timings"):
+                    timings = chunk["timings"]
 
-            def _kill_spinner():
-                """Fully stop the spinner and clear its terminal line."""
-                nonlocal spinner
-                if spinner:
-                    try:
-                        if spinner._live is not None:
-                            spinner._live.stop()
-                            spinner._live = None
-                    except Exception:
-                        pass
-                    spinner = None
-                    # Clear the spinner line and move cursor
-                    sys.stdout.write("\r\033[K")
-                    sys.stdout.flush()
+                def _kill_spinner():
+                    """Fully stop the spinner and clear its terminal line."""
+                    nonlocal spinner
+                    if spinner:
+                        try:
+                            if spinner._live is not None:
+                                spinner._live.stop()
+                                spinner._live = None
+                        except Exception:
+                            pass
+                        spinner = None
+                        # Clear the spinner line and move cursor
+                        sys.stdout.write("\r\033[K")
+                        sys.stdout.flush()
 
-            # Keep reasoning buffered so we can render it as a clean card
-            # instead of the old narrow ANSI box.
-            reasoning_chunk = delta.get("reasoning_content", "")
-            if reasoning_chunk:
-                reasoning_parts.append(reasoning_chunk)
-                token_count += 1
+                # Keep reasoning buffered so we can render it as a clean card
+                # instead of the old narrow ANSI box.
+                reasoning_chunk = delta.get("reasoning_content", "")
+                if reasoning_chunk:
+                    reasoning_parts.append(reasoning_chunk)
+                    token_count += 1
 
-            # Stream text content live (normal style)
-            text_chunk = delta.get("content", "")
-            if text_chunk:
-                if not streaming_started:
-                    streaming_started = True
-                    _kill_spinner()
-                    reasoning_text = "".join(reasoning_parts).strip()
-                    if reasoning_text and REASONING_EFFORT != "none":
-                        console.print(
-                            _render_reasoning_panel(
-                                reasoning_text,
-                                stream_started_at,
+                # Stream text content live (normal style)
+                text_chunk = delta.get("content", "")
+                if text_chunk:
+                    if buffer_text_until_done:
+                        content_parts.append(text_chunk)
+                        token_count += 1
+                        continue
+                    if not streaming_started:
+                        streaming_started = True
+                        _kill_spinner()
+                        reasoning_text = "".join(reasoning_parts).strip()
+                        if reasoning_text and REASONING_EFFORT != "none":
+                            console.print(
+                                _render_reasoning_panel(
+                                    reasoning_text,
+                                    stream_started_at,
+                                )
                             )
-                        )
-                        console.print()
-                    sys.stdout.write("  ")
+                            console.print()
+                        sys.stdout.write("  ")
+                        sys.stdout.flush()
+                    sys.stdout.write(text_chunk)
                     sys.stdout.flush()
-                sys.stdout.write(text_chunk)
-                sys.stdout.flush()
-                content_parts.append(text_chunk)
-                token_count += 1
+                    content_parts.append(text_chunk)
+                    token_count += 1
 
-            # Accumulate tool calls
-            for tc_delta in delta.get("tool_calls", []):
-                idx = tc_delta.get("index", 0)
-                if idx not in tool_calls:
-                    tool_calls[idx] = {
-                        "id": tc_delta.get("id", f"call_{idx}"),
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    }
-                if tc_delta.get("function", {}).get("name"):
-                    tool_calls[idx]["function"]["name"] = tc_delta["function"]["name"]
-                if tc_delta.get("function", {}).get("arguments"):
-                    tool_calls[idx]["function"]["arguments"] += tc_delta["function"][
-                        "arguments"
-                    ]
+                # Accumulate tool calls
+                for tc_delta in delta.get("tool_calls") or []:
+                    idx = tc_delta.get("index", 0)
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {
+                            "id": tc_delta.get("id", f"call_{idx}"),
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    if tc_delta.get("function", {}).get("name"):
+                        tool_calls[idx]["function"]["name"] = tc_delta["function"][
+                            "name"
+                        ]
+                    if tc_delta.get("function", {}).get("arguments"):
+                        tool_calls[idx]["function"]["arguments"] += tc_delta[
+                            "function"
+                        ]["arguments"]
+
+        except KeyboardInterrupt:
+            # Ctrl+C during streaming — stop cleanly
+            finish_reason = "interrupted"
+            if spinner:
+                try:
+                    if spinner._live is not None:
+                        spinner._live.stop()
+                        spinner._live = None
+                except Exception:
+                    pass
+                spinner = None
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+            console.print("\n  [yellow]Interrupted[/]")
 
     reasoning = "".join(reasoning_parts)
     if not streaming_started:
         _kill_spinner()
-        if reasoning.strip() and REASONING_EFFORT != "none":
+        if (
+            reasoning.strip()
+            and REASONING_EFFORT != "none"
+            and not buffer_text_until_done
+        ):
             console.print(
                 _render_reasoning_panel(
                     reasoning,
@@ -3193,6 +4166,10 @@ def chat_api(messages, spinner=None):
 
     # Build compatible response dict
     content = "".join(content_parts)
+    if tool_calls and buffer_text_until_done:
+        content = ""
+    if buffer_text_until_done and content.strip() and not tool_calls:
+        show_response(content)
     msg = {"role": "assistant", "content": content}
     if reasoning:
         msg["reasoning_content"] = reasoning
@@ -3228,6 +4205,11 @@ def show_image_inline(path):
     """Display image inline in terminal — auto-detects best method"""
     if not os.path.isfile(path):
         return
+    if path.lower().endswith(".svg"):
+        console.print(
+            f"  [dim]Image available: {os.path.basename(path)} (SVG preview suppressed)[/]"
+        )
+        return
     timg = "/opt/homebrew/bin/timg"
     if os.path.exists(timg):
         try:
@@ -3236,7 +4218,7 @@ def show_image_inline(path):
                 "i" if os.environ.get("TERM_PROGRAM", "").startswith("iTerm") else "h"
             )
             subprocess.run(
-                [timg, "-g", "60x20", "-C", "-p", proto, path], timeout=5, cwd=CWD
+                [timg, "-g", "24x8", "-C", "-p", proto, path], timeout=5, cwd=CWD
             )
             console.print(f"  [dim green]📸 {os.path.basename(path)}[/]")
             return
@@ -3692,9 +4674,11 @@ def _is_image_file(path):
         return False
 
 
-def show_image_url(url, max_width=50, max_height=15, _depth=0):
+def show_image_url(url, max_width=24, max_height=8, _depth=0):
     """Download and display an image URL inline in terminal."""
     if _depth > 1:
+        return False
+    if url.lower().split("?")[0].endswith(".svg"):
         return False
     try:
         img_name = os.path.basename(url.split("?")[0])[:30] or "preview.jpg"
@@ -3998,15 +4982,12 @@ def agent_loop(messages, perms, session=None):
     recent_tools = []
     self_corrected = False
     stream_idle_timeout = 180  # seconds — finalize partial args if LLM stalls
-    for turn in range(10):
+    max_turns = 6 if _is_small_model_name() else 10
+    for turn in range(max_turns):
         spinner.start()
         spinner.update(tokens=total_tokens)
         messages_for_call = messages
-        last_user_text = ""
-        for _msg in reversed(messages):
-            if _msg.get("role") == "user" and isinstance(_msg.get("content"), str):
-                last_user_text = _msg.get("content", "")
-                break
+        last_user_text = _latest_user_text(messages)
         if _is_image_only_request(last_user_text):
             messages_for_call = messages + [
                 {
@@ -4020,8 +5001,33 @@ def agent_loop(messages, perms, session=None):
                     ),
                 }
             ]
+        elif _request_prefers_real_photo(last_user_text):
+            messages_for_call = messages + [
+                {
+                    "role": "system",
+                    "content": (
+                        "The latest user request is about a real person or real-world subject. "
+                        "Do not use generate_image for that subject. "
+                        "Use web_search with photo/portrait/official/press terms, then use fetch_url "
+                        "to recover a usable real image or source page. "
+                        "If you already have enough biography text, search for the image next instead "
+                        "of doing another general summary search."
+                    ),
+                }
+            ]
+        elif turn == max_turns - 1:
+            messages_for_call = messages_for_call + [
+                {
+                    "role": "system",
+                    "content": (
+                        "Final turn. Do not explore or plan. "
+                        "Either finish with a concise final answer, or take exactly one decisive tool action."
+                    ),
+                }
+            ]
+        selected_tools = _select_tools_for_turn(messages_for_call, recent_tools)
         try:
-            resp = chat_api(messages_for_call, spinner=spinner)
+            resp = chat_api(messages_for_call, spinner=spinner, tools=selected_tools)
         except urllib.error.URLError as e:
             spinner.stop()
             err_str = str(e)
@@ -4034,23 +5040,84 @@ def agent_loop(messages, perms, session=None):
                     continue
             elif "Connection refused" in err_str:
                 console.print(
-                    "[bold red]  ✗ Server not running. Start it with: localcoder --setup[/]"
+                    "[bold yellow]  ✗ Server not running — auto-starting...[/]"
                 )
+                # Try localfit first, then setup wizard
+                import shutil as _sh
+
+                _started = False
+                if _sh.which("localfit"):
+                    try:
+                        import subprocess as _sp2
+
+                        # Use localfit to auto-serve the model from config
+                        from localcoder.setup import load_config as _lc
+
+                        _cfg = _lc() or {}
+                        # Use current session model, then config model_id, then default
+                        _mid = (
+                            MODEL
+                            or _cfg.get("model_id")
+                            or _cfg.get("model")
+                            or "gemma4-e4b"
+                        )
+                        # Normalize ollama-style names
+                        _mid = _mid.split("/")[-1]  # strip any path
+                        console.print(f"  [dim]Running: localfit --serve {_mid}...[/]")
+                        _spawn_background_process(
+                            [_sh.which("localfit"), "--serve", _mid, "--background"],
+                            stdout=_sp2.DEVNULL,
+                            stderr=_sp2.DEVNULL,
+                        )
+                        # Wait for server
+                        for _w in range(30):
+                            time.sleep(2)
+                            try:
+                                urllib.request.urlopen(
+                                    API_BASE.replace("/v1", "") + "/health", timeout=2
+                                )
+                                _started = True
+                                console.print(f"  [green]✓ Server ready[/]")
+                                break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                if not _started:
+                    # Fallback: run setup wizard
+                    try:
+                        from localcoder.setup import wizard
+
+                        console.print(f"  [yellow]Launching setup wizard...[/]")
+                        _wcfg = wizard()
+                        if _wcfg:
+                            _started = True
+                    except Exception:
+                        pass
+                if _started:
+                    continue  # Retry the API call
+                console.print("[bold red]  ✗ Could not start server.[/]")
             else:
                 console.print(f"[bold red]  ✗ Network error: {err_str[:200]}[/]")
+            break
+        except KeyboardInterrupt:
+            spinner.stop()
+            console.print("\n  [yellow]Interrupted — press Ctrl+C again to quit[/]")
             break
         except (json.JSONDecodeError, KeyError) as e:
             spinner.stop()
             logging.getLogger("localcoder").error(f"Malformed API response: {e}")
             console.print(f"[bold red]  ✗ Bad API response — retrying...[/]")
-            if turn < 24:
+            if turn + 1 < max_turns:
                 time.sleep(1)
                 continue
             break
         except Exception as e:
             spinner.stop()
             console.print(f"[bold red]  ✗ {e}[/]")
-            logging.getLogger("localcoder").error(f"Agent loop error: {e}", exc_info=True)
+            logging.getLogger("localcoder").error(
+                f"Agent loop error: {e}", exc_info=True
+            )
             break
         finally:
             # Ensure spinner is always cleaned up before printing
@@ -4061,8 +5128,16 @@ def agent_loop(messages, perms, session=None):
             except Exception:
                 pass
 
-        choice = resp["choices"][0]
+        choices = resp.get("choices", [])
+        if not choices:
+            # Empty response from remote API — skip this turn
+            console.print(
+                "[dim]  (empty response — model may need a different prompt)[/]"
+            )
+            break
+        choice = choices[0]
         msg = choice["message"]
+        interrupted_turn = choice.get("finish_reason") == "interrupted"
         usage = resp.get("usage", {})
         timings = resp.get("timings", {})
         tps = timings.get("predicted_per_second", 0)
@@ -4083,6 +5158,11 @@ def agent_loop(messages, perms, session=None):
         if not msg.get("tool_calls"):
             if content_text:
                 _auto_preview_images(content_text)
+            if interrupted_turn:
+                _persist_interrupted_turn(messages, msg, session=session)
+                console.print(
+                    "  [dim]Interrupted turn saved — continue from here when ready.[/]"
+                )
             elapsed = time.time() - loop_start
             if elapsed < 60:
                 t = f"{elapsed:.0f}s"
@@ -4121,21 +5201,18 @@ def agent_loop(messages, perms, session=None):
                     if not fixed.endswith("}"):
                         fixed += "}"
                     args = json.loads(fixed)
-                    logging.getLogger("localcoder").warning(f"Salvaged partial JSON for {fname}")
+                    logging.getLogger("localcoder").warning(
+                        f"Salvaged partial JSON for {fname}"
+                    )
                 except Exception:
                     args = {}
-                    logging.getLogger("localcoder").error(f"Unparseable args for {fname}: {raw_args[:200]}")
+                    logging.getLogger("localcoder").error(
+                        f"Unparseable args for {fname}: {raw_args[:200]}"
+                    )
 
             # Loop detection — catch repeating patterns, then self-correct
             # Normalize: bash(cat file) counts as read_file(file)
-            if fname == "bash" and args.get("command", "").startswith("cat "):
-                tool_sig = f"read:{args['command'].split()[-1]}"
-            elif fname == "read_file":
-                tool_sig = f"read:{args.get('path', '')}"
-            elif fname == "fetch_url":
-                tool_sig = f"fetch:{args.get('url', '')[:50]}"
-            else:
-                tool_sig = f"{fname}:{json.dumps(args)[:60]}"
+            tool_sig = _normalize_tool_signature(fname, args)
             recent_tools.append(tool_sig)
             # Track consecutive errors
             if not hasattr(agent_loop, "_error_count"):
@@ -4145,53 +5222,34 @@ def agent_loop(messages, perms, session=None):
             if len(recent_tools) > 10:
                 recent_tools = recent_tools[-10:]
 
-            if len(recent_tools) >= 3:
-                last3 = recent_tools[-3:]
-                is_loop = False
-                if last3[0] == last3[1] == last3[2]:
-                    is_loop = True
-                # Catch alternating reads of same file (cat/read_file flip)
-                elif len(set(last3)) <= 2 and all(s.startswith("read:") for s in last3):
-                    is_loop = True
-                # Catch fetch loops (same URL fetched 3 times)
-                elif len(set(last3)) == 1 and last3[0].startswith("fetch:"):
-                    is_loop = True
-
-                if is_loop:
-                    if not self_corrected:
-                        # First loop — force model to act
-                        self_corrected = True
-                        console.print("  [yellow]⚠ Loop detected — redirecting...[/]")
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": "LOOP DETECTED: You already have this data. STOP reading the same file. "
-                                "You have all the information you need. NOW ACT:\n"
-                                "1. If the user asked to build an app — START writing code with write_file\n"
-                                "2. If you need more data from a URL — use web_search or fetch_url\n"
-                                "3. If you need to run something — use bash\n"
-                                "DO NOT read the same file again. Use write_file to create the output NOW.",
-                            }
-                        )
-                        recent_tools.clear()
-                        continue
-                    else:
-                        # Second loop — auto-continue, don't block on user input
-                        console.print(
-                            "  [yellow]⚠ Still looping — forcing action...[/]"
-                        )
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": "You are stuck in a loop. STOP reading files. "
-                                "You already have all the content. "
-                                "START BUILDING NOW. Use write_file to create the output immediately.",
-                            }
-                        )
-                        self_corrected = False
-                        recent_tools.clear()
-                        continue
+            loop_kind = _detect_tool_loop(recent_tools)
+            if loop_kind:
+                if not self_corrected:
+                    # First loop — force model to act
+                    self_corrected = True
+                    console.print("  [yellow]⚠ Loop detected — redirecting...[/]")
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": _loop_feedback(loop_kind),
+                        }
+                    )
+                    recent_tools.clear()
+                    continue
+                else:
+                    # Second loop — auto-continue, don't block on user input
+                    console.print("  [yellow]⚠ Still looping — forcing action...[/]")
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "You are stuck in a tool loop. "
+                            "Stop exploring. Use the minimum remaining tool calls to finish the task now.",
+                        }
+                    )
+                    self_corrected = False
+                    recent_tools.clear()
+                    continue
 
             show_tool_call(fname, args)
             logging.getLogger("localcoder").info(
@@ -4312,24 +5370,37 @@ def agent_loop(messages, perms, session=None):
                 if os.path.isfile(img_path):
                     try:
                         import base64 as _b64m
+
                         img_b64 = _b64m.b64encode(open(img_path, "rb").read()).decode()
                         # Detect mime type from extension
                         ext = os.path.splitext(img_path)[1].lower()
-                        mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                                "webp": "image/webp", "gif": "image/gif"}.get(ext.lstrip("."), "image/png")
-                        text_part = result_str.split("|", 1)[1] if "|" in result_str else result_str
+                        mime = {
+                            "png": "image/png",
+                            "jpg": "image/jpeg",
+                            "jpeg": "image/jpeg",
+                            "webp": "image/webp",
+                            "gif": "image/gif",
+                        }.get(ext.lstrip("."), "image/png")
+                        text_part = (
+                            result_str.split("|", 1)[1]
+                            if "|" in result_str
+                            else result_str
+                        )
                         tool_content = [
                             {"type": "text", "text": text_part},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{img_b64}"},
+                            },
                         ]
                     except Exception:
                         pass  # fall back to text-only
 
             tool_msg = {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": tool_content,
-                }
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": tool_content,
+            }
             messages.append(tool_msg)
             if session:
                 session.add_message(tool_msg)
@@ -4350,7 +5421,18 @@ def agent_loop(messages, perms, session=None):
 # ── Banner ──
 def _model_label():
     bi = BACKEND_INFO
-    name = f"Gemma 4 {bi['size']}" if bi["size"] else bi["model_name"]
+    mn = bi.get("model_name", MODEL) or MODEL
+    # Use actual model name, not hardcoded "Gemma 4"
+    # Try to make a nice display name
+    name = mn
+    for prefix in ["gemma-4-", "gemma4-", "qwen3.5:", "qwen3:", "deepseek-"]:
+        if prefix in mn.lower():
+            # Already readable
+            break
+    if bi.get("size"):
+        # Check if size is already in the name
+        if bi["size"].lower() not in name.lower():
+            name = f"{name} {bi['size']}"
     quant = f" {bi['quant']}" if bi["quant"] else ""
     return f"{name}{quant}"
 
@@ -4379,174 +5461,91 @@ def show_banner():
 
     # GPU stats
     gpu_str = ""
+    swap_str = ""
     try:
-        from localcoder.backends import get_metal_gpu_stats, get_swap_usage_mb, MODELS
+        from localcoder.backends import get_metal_gpu_stats, get_swap_usage_mb
 
         metal = get_metal_gpu_stats()
         swap = get_swap_usage_mb()
-        gt = metal.get("total_mb", 0)
-        model_size_gb = bi.get("size_gb", 0)
-        if not model_size_gb:
-            for mid, m in MODELS.items():
-                if m.get("name", "") in ml or mid in ml.lower().replace(" ", ""):
-                    model_size_gb = m["size_gb"]
-                    break
-        model_mb = int(model_size_gb * 1024) if model_size_gb else 0
-        if gt > 0 and model_mb > 0:
-            pct = min(1.0, model_mb / max(1, gt))
+        gt = metal.get("total_mb", 0) or bi.get("gpu_total_mb", 0)
+        ga = metal.get("alloc_mb", 0) or bi.get("gpu_alloc_mb", 0)
+
+        if gt > 0:
+            pct = min(1.0, ga / max(1, gt))
             bc = "green" if pct < 0.75 else "yellow" if pct < 0.9 else "red"
-            gpu_str = f"[{bc}]{model_mb // 1024}/{gt // 1024}GB GPU[/{bc}]"
+            gpu_str = f"[{bc}]{ga // 1024}/{gt // 1024}GB GPU[/{bc}]"
+        else:
+            gpu_str = "[dim]GPU ?[/]"
+
+        sc = "green" if swap < 2000 else "yellow" if swap < 8000 else "red"
+        swap_str = f"[{sc}]swap {swap // 1024}GB[/{sc}]"
     except ImportError:
         pass
 
-    from rich.text import Text as RText
-    from rich.console import Group
     from rich.live import Live
 
-    # Terminal centering — center the 50-char-wide logo box
-    try:
-        _tw = os.get_terminal_size().columns
-    except Exception:
-        _tw = 80
-    _cpad = " " * max(0, (_tw - 50) // 2)
+    title = _ui("localcoder", "المبرمج المحلي", "localcoder")
+    subtitle = _ui(
+        "simple local coder",
+        "مساعد برمجة محلي وبسيط",
+        "assistant local et simple",
+    )
+    line1, line2, _ = _launch_banner_lines(
+        CWD, bi, ml, gpu_str=gpu_str, swap_str=swap_str
+    )
+    panel_width = max(56, min(console.width - 12, 88))
+    top_pad = max(1, min(5, console.size.height // 7))
 
-    console.print()
+    star_frames = [
+        [
+            "[#1f2937]      ·        ·          ·      [/#1f2937]",
+            "[#374151]   ·        ✦        ·         [/#374151]",
+            "[#1f2937]      ·           ·       ·    [/#1f2937]",
+        ],
+        [
+            "[#1f2937]   ·          ·        ·       [/#1f2937]",
+            "[#4b5563]      ·      ✦       ·         [/#4b5563]",
+            "[#1f2937]   ·        ·           ·      [/#1f2937]",
+        ],
+        [
+            "[#1f2937]      ·         ·       ·      [/#1f2937]",
+            "[#6b7280]   ·         ✦         ·       [/#6b7280]",
+            "[#1f2937]      ·       ·          ·     [/#1f2937]",
+        ],
+    ]
 
-    gpu_icon = "[green]●[/]" if bi.get("gpu") else "[yellow]●[/]"
-    status_line = f"{_cpad}{gpu_icon} [bold cyan]{ml}[/]  ·  {bi['backend']}  ·  {bi['ctx'] or '?'} context  ·  {gpu_str}  ·  [green]$0.00[/]"
-
-    # ── Pre-designed frames (Copilot-style: each frame is a complete screen) ──
-    def _frame(*lines):
-        return Group(*(RText.from_markup(l) for l in lines))
-
-    B = "#e07a5f"  # border/accent
-    G = "#81b29a"  # green accent
-
-    # Helper: build bordered logo frame with optional extras below
-    def _logo_frame(reveal_cols=99, scan=False, subtitle="", extras=None):
-        lines = [f"{_cpad}[{B}]┌──────────────────────────────────────────────────┐[/]"]
-        for r, lt in enumerate(LOGO_TEXT):
-            raw = lt[0]
-            color = raw.split("]")[0] + "]"
-            plain = raw.replace("[/]", "").split("]")[-1] if "]" in raw else raw
-            shown = plain[:reveal_cols]
-            cursor = f"[white bold]▌[/]" if scan and reveal_cols < len(plain) else ""
-            rest = " " * max(0, 48 - len(shown) - (1 if cursor else 0))
-            lines.append(f"{_cpad}[{B}]│[/]{color}{shown}[/]{cursor}{rest}[{B}]│[/]")
-        lines.append(
-            f"{_cpad}[{B}]└──────────────────────────────────────────────────┘[/]"
+    def _render_launch_surface(frame_index=0):
+        stars = star_frames[frame_index % len(star_frames)]
+        status_panel = Panel(
+            Group(
+                Align.center(Text.from_markup(line1)),
+                Align.center(Text.from_markup(line2)),
+            ),
+            box=box.SQUARE,
+            border_style="#27272a",
+            padding=(0, 2),
+            width=panel_width,
         )
-        if subtitle:
-            lines.append(subtitle)
-        if extras:
-            lines.extend(extras)
-        return _frame(*lines)
+        return Group(
+            *[Align.center(Text.from_markup(row)) for row in stars],
+            Align.center(Text(title, style="bold #f5f5f5")),
+            Align.center(Text(subtitle, style="#6b7280")),
+            Text(""),
+            Align.center(status_panel),
+            Text(""),
+        )
 
+    console.clear()
+    console.line(top_pad)
     try:
-        with Live(console=console, refresh_per_second=20, transient=True) as live:
-            # Act 1: Border materializes (corners → edges → full)
-            corners = [
-                f"{_cpad}[{B}]┌┐[/]",
-                *["" for _ in range(12)],
-                f"{_cpad}[{B}]└┘[/]",
-            ]
-            live.update(_frame(*corners))
-            time.sleep(0.07)
-
-            for w in [12, 24, 36, 48]:
-                lines = [f"{_cpad}[{B}]┌{'─' * w}{'─' * (48 - w)}┐[/]"]
-                for _ in range(12):
-                    lines.append(f"{_cpad}[{B}]│[/]{' ' * 48}[{B}]│[/]")
-                lines.append(f"{_cpad}[{B}]└{'─' * w}{'─' * (48 - w)}┘[/]")
-                live.update(_frame(*lines))
-                time.sleep(0.04)
-
-            # Act 2: Logo reveals left-to-right with typing cursor
-            for col in range(0, 48, 3):
-                live.update(_logo_frame(reveal_cols=col, scan=True))
+        with Live(console=console, refresh_per_second=18, transient=True) as live:
+            for idx in range(len(star_frames)):
+                live.update(_render_launch_surface(idx))
                 time.sleep(0.045)
-
-            # Act 3: Full logo holds, subtitle types in
-            live.update(_logo_frame(reveal_cols=99))
-            time.sleep(0.12)
-
-            subs = [
-                f"{_cpad}[{B}]✦[/] [dim]{_ui('Command-line', 'واجهة سطر', 'Interface en ligne')}[/]",
-                f"{_cpad}[{B}]✦[/] [dim]{_ui('Command-line interface', 'واجهة سطر الأوامر', 'Interface en ligne de commande')}[/]",
-                f"{_cpad}[{B}]✦[/] [dim]{_ui('Command-line interface', 'واجهة سطر الأوامر', 'Interface en ligne de commande')}[/]  [bold {G}]{_ui('✓ offline', '✓ بدون إنترنت', '✓ hors ligne')}[/]",
-            ]
-            for s in subs:
-                live.update(_logo_frame(reveal_cols=99, subtitle=s))
-                time.sleep(0.1)
-
-            # Act 4: Description + status appear
-            desc = [
-                "",
-                f"{_cpad}{_ui('Write, test, and debug code right from your terminal.', 'اكتب واختبر وصحح الأكواد مباشرة من الطرفية.', 'Écrivez, testez et déboguez du code depuis votre terminal.')}",
-                f"{_cpad}{_ui('Runs [bold]100% on your GPU[/]. No API keys. No cloud. Enter [bold]?[/] for help.', 'يعمل [bold]100% على GPU[/]. بدون مفاتيح API. بدون سحابة. اكتب [bold]?[/] للمساعدة.', 'Tourne [bold]100% sur votre GPU[/]. Pas de clés API. Pas de cloud. Tapez [bold]?[/] pour l\u2019aide.')}",
-            ]
-            live.update(_logo_frame(reveal_cols=99, subtitle=subs[-1], extras=desc))
-            time.sleep(0.2)
-
-            full_extras = desc + [
-                "",
-                status_line,
-                f"{_cpad}[dim]{os.path.basename(CWD)}/[/]",
-                "",
-            ]
-            live.update(
-                _logo_frame(reveal_cols=99, subtitle=subs[-1], extras=full_extras)
-            )
-            time.sleep(0.5)
-
     except Exception:
         pass
 
-    # ── Static final render (centered, all languages show ASCII art) ──
-    # ASCII art logo — centered
-    console.print(
-        f"{_cpad}[{B}]┌──────────────────────────────────────────────────┐[/]"
-    )
-    for lt in LOGO_TEXT:
-        raw = lt[0]
-        color = raw.split("]")[0] + "]"
-        plain = raw.replace("[/]", "").split("]")[-1] if "]" in raw else raw
-        pad = " " * max(0, 48 - len(plain))
-        console.print(f"{_cpad}[{B}]│[/]{lt[0]}{pad}[{B}]│[/]")
-    console.print(
-        f"{_cpad}[{B}]└──────────────────────────────────────────────────┘[/]"
-    )
-
-    if UI_LANG == "ar":
-        # Arabic: large styled title + subtitle below logo
-        console.print(
-            f"{_cpad}[{B}]✦[/] [dim]{_t('cmd_line')}[/]  [bold {G}]{_t('offline')}[/]"
-        )
-        console.print()
-        console.print(f"{_cpad}[bold #c084fc]  ✦  {_t('banner_title')}  ✦[/]")
-        console.print(f"{_cpad}[dim]  {_t('banner_subtitle')}[/]")
-        console.print()
-        console.print(f"{_cpad}{_t('desc_line1')}")
-        console.print(f"{_cpad}{_t('desc_line2')}")
-    elif UI_LANG == "fr":
-        console.print(
-            f"{_cpad}[{B}]✦[/] [dim]{_t('cmd_line')}[/]  [bold {G}]{_t('offline')}[/]"
-        )
-        console.print()
-        console.print(f"{_cpad}[bold #c084fc]  ✦  LocalCoder  ✦[/]")
-        console.print(f"{_cpad}[dim]  {_t('banner_subtitle')}[/]")
-        console.print()
-        console.print(f"{_cpad}{_t('desc_line1')}")
-        console.print(f"{_cpad}{_t('desc_line2')}")
-    else:
-        console.print(
-            f"{_cpad}[{B}]✦[/] [dim]Command-line interface[/]  [bold {G}]✓ offline[/]"
-        )
-        console.print()
-        console.print(f"{_cpad}Write, test, and debug code right from your terminal.")
-        console.print(
-            f"{_cpad}Runs [bold]100% on your GPU[/]. No API keys. No cloud. Enter [bold]?[/] for help."
-        )
+    console.print(_render_launch_surface(len(star_frames) - 1))
     console.print()
     console.print(status_line)
     console.print(f"{_cpad}[dim]{os.path.basename(CWD)}/[/]")
@@ -4557,13 +5556,14 @@ _toolbar_gpu_cache = {"text": "", "ts": 0}
 
 
 def get_toolbar():
-    """Bottom toolbar — model + GPU + offline. GPU stats cached (no ioreg per keystroke)."""
+    """Bottom toolbar — muted single-line status with simple local-first hints."""
     bi = BACKEND_INFO
     ml = _model_label()
     ctx = bi["ctx"] or "?"
+    cwd_name = os.path.basename(CWD.rstrip(os.sep)) or CWD
 
     # Cache GPU part — compute once, reuse for 60s
-    gpu_part = _toolbar_gpu_cache["text"]
+    gpu_part = ""
     if time.time() - _toolbar_gpu_cache["ts"] > 60:
         try:
             from localcoder.backends import MODELS
@@ -4576,19 +5576,32 @@ def get_toolbar():
                     model_gb = m["size_gb"]
                     break
             if model_gb > 0:
-                gc = "ansigreen" if model_gb < gt_gb else "ansired"
-                gpu_part = f' <style bg="{gc}" fg="ansiblack"> GPU {int(model_gb)}/{gt_gb}GB </style>'
+                gpu_part = f"GPU {int(model_gb)}/{gt_gb}GB"
                 _toolbar_gpu_cache["text"] = gpu_part
                 _toolbar_gpu_cache["ts"] = time.time()
         except ImportError:
             pass
+    else:
+        gpu_part = _toolbar_gpu_cache["text"]
+
+    left_bits = [
+        html_escape(ml),
+        html_escape(f"{ctx} ctx"),
+        html_escape(cwd_name),
+    ]
+    if gpu_part:
+        left_bits.append(html_escape(gpu_part))
+    left = " · ".join(bit for bit in left_bits if bit)
+    right = "shift+enter new line · /continue resume · ? help"
 
     return HTML(
-        f" <b>{ml}</b>"
-        f' <style bg="ansigreen" fg="ansiblack"> {bi["backend"]} </style>'
-        f' <style bg="ansiblue" fg="ansiwhite"> {ctx} </style>'
-        f"{gpu_part}"
-        f' <style bg="ansidarkgray" fg="ansiwhite"> {_ui("✓ offline", "✓ بدون إنترنت", "✓ hors ligne")} </style>'
+        f' <style fg="#d4d4d8">{left}</style>'
+        f' <style fg="#52525b">  ·  </style>'
+        f' <style fg="#71717a">{html_escape(bi["backend"])}</style>'
+        f' <style fg="#52525b">  ·  </style>'
+        f' <style fg="#71717a">{html_escape(_ui("local", "محلي", "local"))}</style>'
+        f' <style fg="#52525b">  ·  </style>'
+        f' <style fg="#71717a">{right}</style>'
     )
 
 
@@ -4648,6 +5661,12 @@ def main(argv=None):
         default=None,
         help="API base URL (default: http://127.0.0.1:8089/v1)",
     )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for OpenAI-compatible remote endpoints",
+    )
     args = parser.parse_args(argv)
 
     # Override globals
@@ -4658,7 +5677,9 @@ def main(argv=None):
         if not args.api:
             API_BASE = "http://127.0.0.1:11434/v1"
     if args.api:
-        API_BASE = args.api
+        API_BASE = args.api.rstrip("/")
+    if args.api_key:
+        os.environ["LOCALCODER_API_KEY"] = args.api_key
     if getattr(args, "arabic", False):
         UI_LANG = "ar"
         os.environ["LOCALCODER_UI_LANG"] = "ar"
@@ -4710,7 +5731,9 @@ def main(argv=None):
     mcp_tools = mcp_mgr.get_tool_schemas()
     # Don't inject MCP tool schemas into TOOLS for small models (E4B) —
     # too many tools confuses them. MCP tools still work via exec_tool aliases.
-    is_small_model = any(tag in MODEL.lower() for tag in ("e4b", "e2b", "4b", "2b", "small"))
+    is_small_model = any(
+        tag in MODEL.lower() for tag in ("e4b", "e2b", "4b", "2b", "small")
+    )
     if mcp_tools and not is_small_model:
         TOOLS.extend(mcp_tools)
         mcp_names = [t["function"]["name"] for t in mcp_tools]
@@ -4718,9 +5741,13 @@ def main(argv=None):
         for t in mcp_tools:
             Permissions.SAFE.add(t["function"]["name"])
     if mcp_tools:
-        console.print(f"  [dim]MCP: {len(mcp_tools)} tools from {len(mcp_mgr.servers)} server(s){' (aliased)' if is_small_model else ''}[/]")
+        console.print(
+            f"  [dim]MCP: {len(mcp_tools)} tools from {len(mcp_mgr.servers)} server(s){' (aliased)' if is_small_model else ''}[/]"
+        )
 
-    _skills_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '.agents', 'skills'))
+    _skills_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", ".agents", "skills")
+    )
 
     # ── Custom system prompt from --system flag ──
     if args.system:
@@ -4738,13 +5765,17 @@ def main(argv=None):
             "content": f"You are Local Coder, a coding agent. CWD: {CWD}\n"
             f"RESPOND ONLY WITH TOOL CALLS. Never put code in chat text.\n\n"
             f"TOOLS: generate_image, write_file, read_file, edit_file, bash, preview_app, web_search, fetch_url\n\n"
-            f"WORKFLOW:\n"
-            f"1. generate_image(prompt='detailed description', filename='name.png', size='256x256', steps=2) for each image\n"
-            f"2. write_file(path='index.html', content='complete HTML') with ALL code\n"
-            f"3. preview_app(path='index.html') to verify\n\n"
-            f"CSS: dark bg #0a0a14, cards rgba(255,255,255,0.04) blur(20px) rounded-24px, "
-            f"buttons gradient(135deg,#6366f1,#8b5cf6) rounded-14px, "
-            f"titles gradient(#f97316,#22c55e) bg-clip text, system-ui font, hover transitions.\n\n"
+            f"SMALL-MODEL WORKFLOW:\n"
+            f"1. Read only the minimum context you need.\n"
+            f"2. If the user is building a landing page, bio page, timeline, portfolio, or gallery, include ONE strong visual by default unless they asked for text-only.\n"
+            f"3. For real people/places/products use web_search/fetch_url to find a real photo. For fictional or decorative art use generate_image(prompt='description', filename='name.png', size='256x256', steps=2).\n"
+            f"4. After the visual step, immediately write_file/edit_file. Do not keep generating images.\n"
+            f"5. Use preview_app only after writing or editing the page.\n\n"
+            f"FRONTEND DESIGN:\n"
+            f"- Follow the user's style words literally. If they want editorial, modern Wikipedia, white, light, or minimal, do NOT force dark mode.\n"
+            f"- Pick one coherent direction with strong spacing, typography, and layout hierarchy.\n"
+            f"- For article/biography pages: use a clean reading layout, infobox/sidebar, section anchors, restrained blue links, figure captions, and source blocks.\n"
+            f"- Avoid generic purple gradients unless the user explicitly asks for that look.\n\n"
             f"NEVER explain. NEVER plan. NEVER ask questions. Just call tools.",
         }
     else:
@@ -4754,159 +5785,145 @@ def main(argv=None):
             "content": f"You are Local Coder, an autonomous AI coding agent. Working directory: {CWD}\n"
             f"Platform: macOS. Date: {time.strftime('%B %d, %Y')}.\n"
             f"You have tools. ALWAYS use tools to act. Never put code in chat — use write_file.\n\n"
-            f"YOUR WORKFLOW (follow this exact order):\n"
-        f"Step 1. GENERATE IMAGES FIRST — call generate_image for each image needed\n"
-        f"   generate_image(prompt='cute sleeping cat icon, kawaii, pastel pink', filename='cat-sleep.png', size='256x256', steps=2)\n"
-        f"   generate_image(prompt='playful dog icon, kawaii, pastel blue', filename='dog-play.png', size='256x256', steps=2)\n"
-        f"Step 2. WRITE CODE — call write_file with complete HTML referencing those images\n"
-        f"   write_file(path='index.html', content='<!DOCTYPE html>...<img src=\"cat-sleep.png\">...')\n"
-        f"Step 3. PREVIEW — call preview_app to see the result in the browser\n"
-        f"   preview_app(path='index.html')\n"
-        f"Step 4. FIX if needed — if preview shows issues, call edit_file to fix, then preview_app again\n\n"
-        f"IMAGES — MANDATORY:\n"
-        f"- ALWAYS call generate_image to create images. NEVER use placeholder URLs or stock photo sites.\n"
-        f"- Call generate_image BEFORE write_file (so the images exist when the page loads).\n"
-        f"- Use size='256x256' steps=2 for icons (fast ~4s). Use size='512x512' steps=4 for hero images.\n\n"
-        f"APP TEMPLATES (pre-built — ALWAYS check before building from scratch):\n"
-        f"Skills directory: {_skills_dir}\n"
-        f"  1. bash: ls {_skills_dir}\n"
-        f"  2. Pick closest match: 'math quiz' → quiz-game, 'vocabulary' → flashcards, 'fan page' → gallery\n"
-        f"  3. read_file the SKILL.md, then read_file assets/index.html\n"
-        f"  4. Customize with write_file. Generate images with generate_image. Preview with preview_app.\n\n"
-        f"ARCHITECTURE:\n"
-        f"- Landing page / gallery / portfolio → ONE index.html file. No server.\n"
-        f"- AI-powered app (chatbot, scanner) → 3 files: package.json + server.js + index.html\n"
-        f"  NEVER build Express for a simple static page.\n\n"
-        f"WEB APP ARCHITECTURE (ONLY for AI-powered apps that need a backend):\n\n"
-        f"APP STRUCTURE: Always 3 files in the SAME directory:\n"
-        f"  package.json, server.js, index.html (all inline CSS+JS)\n"
-        f"  server.js must serve index.html with: app.get('/', (req,res) => res.sendFile(__dirname+'/index.html'));\n\n"
-        f"SERVER.JS TEMPLATE (copy this pattern exactly):\n"
-        f"  const express = require('express');\n"
-        f"  const app = express();\n"
-        f"  app.use(express.json({{limit:'50mb'}}));\n"
-        f"  const API_BASE = process.env.LLM_API_BASE || 'http://127.0.0.1:8089/v1';\n"
-        f"  const MODEL = process.env.LLM_MODEL || 'local';\n"
-        f"  app.get('/', (req,res) => res.sendFile(__dirname+'/index.html'));\n"
-        f"  app.post('/api/analyze', async (req,res) => {{\n"
-        f"    const {{message, image}} = req.body;\n"
-        f"    const userContent = image\n"
-        f"      ? [{{type:'text',text:message}}, {{type:'image_url',image_url:{{url:image}}}}]\n"
-        f"      : message;\n"
-        f"    const r = await fetch(API_BASE+'/chat/completions', {{\n"
-        f"      method:'POST', headers:{{'Content-Type':'application/json'}},\n"
-        f"      body:JSON.stringify({{model:MODEL, stream:false, max_tokens:2048,\n"
-        f"        messages:[{{role:'system',content:SYSTEM_PROMPT}}, {{role:'user',content:userContent}}]}}) }});\n"
-        f"    const data = await r.json();\n"
-        f"    res.json({{analysis: data.choices[0].message.content}}); }});\n"
-        f"  app.listen(3000);\n\n"
-        f"DESIGN SYSTEM (copy these EXACT values for all pages):\n"
-        f"  COLORS: --bg:#0a0a14; --surface:rgba(255,255,255,0.04); --border:rgba(255,255,255,0.08); --text:#e2e8f0; --muted:#94a3b8; --accent:#8b5cf6; --accent2:#6366f1; --success:#22c55e; --warm:#f97316;\n"
-        f"  FONT: font-family:system-ui,-apple-system,sans-serif; base 16px; line-height:1.6;\n"
-        f"  SPACING: 0.5rem 1rem 1.5rem 2rem 3rem 4rem (use rem not px);\n"
-        f"  RADIUS: buttons 14px; cards 24px; inputs 12px; pills 9999px; icons 50%;\n"
-        f"  BODY: background:var(--bg); color:var(--text); min-height:100vh; padding:2rem; margin:0 auto; max-width:1200px;\n"
-        f"  CARD: background:var(--surface); backdrop-filter:blur(20px); border:1px solid var(--border); border-radius:24px; padding:2rem; transition:all 0.3s;\n"
-        f"  CARD:HOVER: transform:translateY(-8px); border-color:rgba(255,255,255,0.2); box-shadow:0 20px 40px rgba(0,0,0,0.3);\n"
-        f"  BUTTON: background:linear-gradient(135deg,var(--accent2),var(--accent)); color:white; font-weight:600; padding:14px 28px; border:none; border-radius:14px; cursor:pointer; transition:all 0.2s;\n"
-        f"  BUTTON:HOVER: transform:translateY(-2px) scale(1.02); box-shadow:0 8px 25px rgba(139,92,246,0.4);\n"
-        f"  TITLE: font-size:clamp(2rem,5vw,3.5rem); font-weight:800; background:linear-gradient(135deg,var(--warm),var(--success)); -webkit-background-clip:text; color:transparent;\n"
-        f"  SUBTITLE: color:var(--muted); font-size:1.15rem; max-width:600px; margin:0 auto 2rem;\n"
-        f"  GRID: display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:2rem;\n"
-        f"  INPUT: background:rgba(255,255,255,0.05); border:1px solid var(--border); border-radius:12px; padding:14px 18px; color:white; font-size:1rem; width:100%; transition:border-color 0.2s;\n"
-        f"  INPUT:FOCUS: border-color:var(--accent); outline:none; box-shadow:0 0 0 3px rgba(139,92,246,0.15);\n"
-        f"  HERO: text-align:center; padding:4rem 1rem 3rem;\n"
-        f"  NAV: display:flex; justify-content:space-between; align-items:center; padding:1rem 2rem; background:rgba(0,0,0,0.3); backdrop-filter:blur(10px); border-bottom:1px solid var(--border);\n"
-        f"  FOOTER: text-align:center; padding:2rem; color:var(--muted); border-top:1px solid var(--border); margin-top:auto;\n"
-        f"  BADGE: display:inline-block; padding:4px 12px; border-radius:9999px; font-size:0.8rem; background:rgba(139,92,246,0.15); color:var(--accent);\n"
-        f"  ICON-CIRCLE: width:80px; height:80px; border-radius:50%; border:3px solid var(--accent); padding:8px; object-fit:cover;\n"
-        f"  SECTION: padding:4rem 0; text-align:center;\n"
-        f"  STATS: display:flex; justify-content:center; gap:3rem; .stat-num font-size:2.5rem font-weight:800 color:var(--accent);\n"
-        f"  ANIMATION: @keyframes fadeUp{{from{{opacity:0;transform:translateY(20px)}}to{{opacity:1;transform:translateY(0)}}}} .fade-up{{animation:fadeUp 0.6s ease forwards}}\n"
-        f"  GLASS-EFFECT: background:rgba(255,255,255,0.03); backdrop-filter:blur(20px) saturate(180%); -webkit-backdrop-filter:blur(20px) saturate(180%);\n\n"
-        f"- IMAGE UPLOAD (must use FileReader, never fake it):\n"
-        f"  let imageBase64 = null;\n"
-        f"  function uploadImage() {{\n"
-        f"    const input = document.createElement('input');\n"
-        f"    input.type='file'; input.accept='image/*';\n"
-        f"    input.onchange = e => {{\n"
-        f"      const file = e.target.files[0]; if(!file) return;\n"
-        f"      const reader = new FileReader();\n"
-        f"      reader.onload = ev => {{ imageBase64 = ev.target.result;\n"
-        f"        document.getElementById('preview').src = imageBase64;\n"
-        f"        document.getElementById('preview').style.display = 'block'; }};\n"
-        f"      reader.readAsDataURL(file); }};\n"
-        f"    input.click(); }}\n\n"
-        f"- CAMERA CAPTURE (must use getUserMedia, never fake it):\n"
-        f"  async function openCamera() {{\n"
-        f"    const stream = await navigator.mediaDevices.getUserMedia({{video:{{facingMode:'environment'}}}});\n"
-        f"    const video = document.getElementById('camVideo');\n"
-        f"    video.srcObject = stream; video.style.display='block'; video.play();\n"
-        f"    document.getElementById('captureBtn').style.display='inline-block'; }}\n"
-        f"  function capturePhoto() {{\n"
-        f"    const video = document.getElementById('camVideo');\n"
-        f"    const canvas = document.createElement('canvas');\n"
-        f"    canvas.width=video.videoWidth; canvas.height=video.videoHeight;\n"
-        f"    canvas.getContext('2d').drawImage(video,0,0);\n"
-        f"    imageBase64 = canvas.toDataURL('image/jpeg',0.8);\n"
-        f"    document.getElementById('preview').src = imageBase64;\n"
-        f"    document.getElementById('preview').style.display='block';\n"
-        f"    video.srcObject.getTracks().forEach(t=>t.stop()); video.style.display='none'; }}\n\n"
-        f"- SEND TO API (always this pattern):\n"
-        f"  async function analyze() {{\n"
-        f"    const msg = document.getElementById('input').value;\n"
-        f"    if(!msg && !imageBase64) return;\n"
-        f"    document.getElementById('result').innerHTML = '<div class=\"loading\">Analyzing...</div>';\n"
-        f"    const res = await fetch('/api/analyze', {{\n"
-        f"      method:'POST', headers:{{'Content-Type':'application/json'}},\n"
-        f"      body:JSON.stringify({{message:msg||'Analyze this', image:imageBase64}}) }});\n"
-        f"    const data = await res.json();\n"
-        f"    document.getElementById('result').innerHTML = formatMarkdown(data.analysis);\n"
-        f"    imageBase64 = null; }}\n\n"
-        f"- MARKDOWN RENDERER:\n"
-        f"  function formatMarkdown(text) {{\n"
-        f"    return text.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>')\n"
-        f"      .replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>')\n"
-        f"      .replace(/^\\* (.+)$/gm,'<li>$1</li>').replace(/\\n/g,'<br>'); }}\n\n"
-        f"- LOADING/SCANNING ANIMATION (always show while waiting for API):\n"
-        f"  CSS: @keyframes scan {{ 0%{{transform:translateY(-100%)}} 100%{{transform:translateY(100%)}} }}\n"
-        f"  .scanning {{ position:relative; overflow:hidden; }}\n"
-        f"  .scanning::after {{ content:''; position:absolute; left:0; right:0; height:2px;\n"
-        f"    background:linear-gradient(90deg,transparent,#22c55e,transparent); animation:scan 1.5s infinite; }}\n"
-        f"  Also add a pulsing text: <div class='loading'>🔬 Scanning ingredients<span class='dots'></span></div>\n"
-        f"  CSS: @keyframes dots {{ 0%{{content:''}} 33%{{content:'.'}} 66%{{content:'..'}} 100%{{content:'...'}} }}\n"
-        f"  .dots::after {{ content:''; animation:dots 1.5s infinite steps(4); }}\n"
-        f"  Show loading BEFORE fetch, hide AFTER response. Disable button during loading.\n\n"
-        f"- NEVER fake FileReader/camera/API calls. ALWAYS use real implementations above.\n"
-        f"- NEVER use SSE/streaming. Use stream:false and return full JSON.\n"
-        f"- ALWAYS serve index.html from __dirname, NOT from a public/ subdirectory.\n"
-        f"- ALWAYS test after building: npm install, node server.js &, curl POST to verify.\n\n"
-        f"SELF-TESTING (MANDATORY for HTML/web apps):\n"
-        f"After writing ANY index.html or web app, you MUST test it:\n"
-        f"1. If static HTML: run 'bash: python3 -m http.server 8888 &' then 'bash: sleep 1 && curl -s http://localhost:8888/ | head -5' to verify it loads\n"
-        f"2. If Express app: run 'bash: node server.js &' then 'bash: sleep 2 && curl -s http://localhost:3000/ | head -5'\n"
-        f'3. Check for JS errors: run \'bash: node -e "const fs=require(\\"fs\\"); const html=fs.readFileSync(\\"index.html\\",\\"utf8\\"); const scripts=html.match(/<script[^>]*>([\\\\s\\\\S]*?)<\\\\/script>/g); scripts?.forEach(s => {{ try {{ new Function(s.replace(/<\\\\/?script[^>]*>/g,\\"\\")); }} catch(e) {{ console.error(\\"JS ERROR:\\", e.message); }} }})"\'\n'
-        f"4. If ANY test fails: read the error, fix the code, test again. DO NOT STOP until tests pass.\n"
-        f"5. For interactive elements (buttons, forms): verify onclick/event handlers exist in the HTML.\n"
-        f"6. For SVG: verify paths are valid (use M, L, A, Z commands with real coordinates, not placeholders).\n\n"
-        f"BROWSER TESTING (use computer_use to test interactively):\n"
-        f"- After building an HTML app, open it: computer_use action:open:file:///path/to/index.html\n"
-        f"- Take screenshot to see the result\n"
-        f"- Click buttons: computer_use action:click:x,y\n"
-        f"- If something looks wrong, fix the code and re-test\n\n"
-        f"COMMON BUGS TO AVOID:\n"
-        f'- Start screen not hiding on button click: always add onclick=\'document.getElementById("screen1").style.display="none"; document.getElementById("screen2").style.display="block"\'\n'
-        f"- SVG pie/chart slices: use Math.cos(angle*Math.PI/180)*radius and Math.sin() for arc endpoints. Never approximate.\n"
-        f"- Fetch to /api without server: static HTML files can't call /api. Use local JS logic or start Express.\n"
-        f"- Missing CSS transitions: always add transition on hover/active states.\n\n"
-        f"RULES (CRITICAL — follow strictly):\n"
-        f"- NEVER explain or narrate. NEVER ask for confirmation. NEVER say 'I will' or 'Let me'. Just call tools.\n"
-        f"- NEVER put code in chat messages. ALL code goes through write_file.\n"
-        f"- NEVER use placeholder image URLs. ALL images go through generate_image.\n"
-        f"- NEVER stop after generating images. ALWAYS continue to write_file then preview_app.\n"
-        f"- For EVERY user request: call tools immediately. No planning text. No questions. Just act.\n\n"
-        f"REMEMBER: You are an AGENT, not a chatbot. Your response should be TOOL CALLS, not text.",
-    }
+            f"YOUR WORKFLOW (choose only the steps needed):\n"
+            f"Step 1. Gather only the minimum facts or file context you need.\n"
+            f"Step 2. If the user is building a landing page, bio page, timeline, portfolio, fan page, or gallery, include at least one meaningful visual unless they asked for text-only.\n"
+            f"Step 3. WRITE CODE — call write_file with complete HTML referencing any visuals you chose.\n"
+            f"Step 4. PREVIEW — call preview_app to see the result in the browser.\n"
+            f"Step 5. FIX if needed — if preview shows issues, call edit_file or write_file, then preview_app again.\n\n"
+            f"IMAGES — USE SPARINGLY:\n"
+            f"- For REAL people/places/things (Einstein, Paris, iPhone): prefer web_search + fetch_url to find a real photo. NEVER AI-generate a fake portrait when a real subject is requested.\n"
+            f"- For CREATIVE content (icons, illustrations, logos, abstract art, fictional): use generate_image.\n"
+            f"- Default to ONE visual for a landing page unless the user explicitly asks for more.\n"
+            f"- After the visual step, continue immediately to write_file/edit_file. Do not keep generating images.\n"
+            f"- Use size='256x256' steps=2 for icons (fast ~4s). Use size='512x512' steps=4 for a single hero image.\n\n"
+            f"APP TEMPLATES (pre-built — ALWAYS check before building from scratch):\n"
+            f"Skills directory: {_skills_dir}\n"
+            f"  1. bash: ls {_skills_dir}\n"
+            f"  2. Pick closest match: 'math quiz' → quiz-game, 'vocabulary' → flashcards, 'fan page' → gallery\n"
+            f"  3. read_file the SKILL.md, then read_file assets/index.html\n"
+            f"  4. Customize with write_file. Add visuals only if they improve the page. Preview with preview_app.\n\n"
+            f"ARCHITECTURE:\n"
+            f"- Landing page / gallery / portfolio → ONE index.html file. No server.\n"
+            f"- AI-powered app (chatbot, scanner) → 3 files: package.json + server.js + index.html\n"
+            f"  NEVER build Express for a simple static page.\n\n"
+            f"WEB APP ARCHITECTURE (ONLY for AI-powered apps that need a backend):\n\n"
+            f"APP STRUCTURE: Always 3 files in the SAME directory:\n"
+            f"  package.json, server.js, index.html (all inline CSS+JS)\n"
+            f"  server.js must serve index.html with: app.get('/', (req,res) => res.sendFile(__dirname+'/index.html'));\n\n"
+            f"SERVER.JS TEMPLATE (copy this pattern exactly):\n"
+            f"  const express = require('express');\n"
+            f"  const app = express();\n"
+            f"  app.use(express.json({{limit:'50mb'}}));\n"
+            f"  const API_BASE = process.env.LLM_API_BASE || 'http://127.0.0.1:8089/v1';\n"
+            f"  const MODEL = process.env.LLM_MODEL || 'local';\n"
+            f"  app.get('/', (req,res) => res.sendFile(__dirname+'/index.html'));\n"
+            f"  app.post('/api/analyze', async (req,res) => {{\n"
+            f"    const {{message, image}} = req.body;\n"
+            f"    const userContent = image\n"
+            f"      ? [{{type:'text',text:message}}, {{type:'image_url',image_url:{{url:image}}}}]\n"
+            f"      : message;\n"
+            f"    const r = await fetch(API_BASE+'/chat/completions', {{\n"
+            f"      method:'POST', headers:{{'Content-Type':'application/json'}},\n"
+            f"      body:JSON.stringify({{model:MODEL, stream:false, max_tokens:2048,\n"
+            f"        messages:[{{role:'system',content:SYSTEM_PROMPT}}, {{role:'user',content:userContent}}]}}) }});\n"
+            f"    const data = await r.json();\n"
+            f"    res.json({{analysis: data.choices[0].message.content}}); }});\n"
+            f"  app.listen(3000);\n\n"
+            f"FRONTEND DESIGN (adapt to the user's brief; do NOT force a house style):\n"
+            f"  - Match the requested tone exactly: editorial, modern Wikipedia, product marketing, playful, minimal, etc.\n"
+            f"  - If the user asks for white/light/clean, use a light background and dark text. Do NOT drift back to black or neon.\n"
+            f"  - Use one coherent palette, one coherent type system, and strong spacing rhythm. Avoid generic purple gradients unless asked.\n"
+            f"  - Make bold structural changes when asked to redesign. Do not just tweak colors.\n"
+            f"  - For biography/article pages: build a readable article layout with a lead section, infobox or metadata rail, figure caption, section TOC, pull quote, and sources.\n"
+            f"  - For editorial layouts, prefer serif or old-style display headings paired with a clean sans-serif body, moderate line length, subtle borders, and restrained blue accents.\n"
+            f"  - For interactive product pages, prefer crisp hierarchy, intentional card systems, and motion that supports the content instead of decorative noise.\n"
+            f"  - Always honor explicit user corrections immediately (example: 'not black', 'more white', 'like Wikipedia', 'more modern').\n\n"
+            f"- IMAGE UPLOAD (must use FileReader, never fake it):\n"
+            f"  let imageBase64 = null;\n"
+            f"  function uploadImage() {{\n"
+            f"    const input = document.createElement('input');\n"
+            f"    input.type='file'; input.accept='image/*';\n"
+            f"    input.onchange = e => {{\n"
+            f"      const file = e.target.files[0]; if(!file) return;\n"
+            f"      const reader = new FileReader();\n"
+            f"      reader.onload = ev => {{ imageBase64 = ev.target.result;\n"
+            f"        document.getElementById('preview').src = imageBase64;\n"
+            f"        document.getElementById('preview').style.display = 'block'; }};\n"
+            f"      reader.readAsDataURL(file); }};\n"
+            f"    input.click(); }}\n\n"
+            f"- CAMERA CAPTURE (must use getUserMedia, never fake it):\n"
+            f"  async function openCamera() {{\n"
+            f"    const stream = await navigator.mediaDevices.getUserMedia({{video:{{facingMode:'environment'}}}});\n"
+            f"    const video = document.getElementById('camVideo');\n"
+            f"    video.srcObject = stream; video.style.display='block'; video.play();\n"
+            f"    document.getElementById('captureBtn').style.display='inline-block'; }}\n"
+            f"  function capturePhoto() {{\n"
+            f"    const video = document.getElementById('camVideo');\n"
+            f"    const canvas = document.createElement('canvas');\n"
+            f"    canvas.width=video.videoWidth; canvas.height=video.videoHeight;\n"
+            f"    canvas.getContext('2d').drawImage(video,0,0);\n"
+            f"    imageBase64 = canvas.toDataURL('image/jpeg',0.8);\n"
+            f"    document.getElementById('preview').src = imageBase64;\n"
+            f"    document.getElementById('preview').style.display='block';\n"
+            f"    video.srcObject.getTracks().forEach(t=>t.stop()); video.style.display='none'; }}\n\n"
+            f"- SEND TO API (always this pattern):\n"
+            f"  async function analyze() {{\n"
+            f"    const msg = document.getElementById('input').value;\n"
+            f"    if(!msg && !imageBase64) return;\n"
+            f"    document.getElementById('result').innerHTML = '<div class=\"loading\">Analyzing...</div>';\n"
+            f"    const res = await fetch('/api/analyze', {{\n"
+            f"      method:'POST', headers:{{'Content-Type':'application/json'}},\n"
+            f"      body:JSON.stringify({{message:msg||'Analyze this', image:imageBase64}}) }});\n"
+            f"    const data = await res.json();\n"
+            f"    document.getElementById('result').innerHTML = formatMarkdown(data.analysis);\n"
+            f"    imageBase64 = null; }}\n\n"
+            f"- MARKDOWN RENDERER:\n"
+            f"  function formatMarkdown(text) {{\n"
+            f"    return text.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>')\n"
+            f"      .replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>')\n"
+            f"      .replace(/^\\* (.+)$/gm,'<li>$1</li>').replace(/\\n/g,'<br>'); }}\n\n"
+            f"- LOADING/SCANNING ANIMATION (always show while waiting for API):\n"
+            f"  CSS: @keyframes scan {{ 0%{{transform:translateY(-100%)}} 100%{{transform:translateY(100%)}} }}\n"
+            f"  .scanning {{ position:relative; overflow:hidden; }}\n"
+            f"  .scanning::after {{ content:''; position:absolute; left:0; right:0; height:2px;\n"
+            f"    background:linear-gradient(90deg,transparent,#22c55e,transparent); animation:scan 1.5s infinite; }}\n"
+            f"  Also add a pulsing text: <div class='loading'>🔬 Scanning ingredients<span class='dots'></span></div>\n"
+            f"  CSS: @keyframes dots {{ 0%{{content:''}} 33%{{content:'.'}} 66%{{content:'..'}} 100%{{content:'...'}} }}\n"
+            f"  .dots::after {{ content:''; animation:dots 1.5s infinite steps(4); }}\n"
+            f"  Show loading BEFORE fetch, hide AFTER response. Disable button during loading.\n\n"
+            f"- NEVER fake FileReader/camera/API calls. ALWAYS use real implementations above.\n"
+            f"- NEVER use SSE/streaming. Use stream:false and return full JSON.\n"
+            f"- ALWAYS serve index.html from __dirname, NOT from a public/ subdirectory.\n"
+            f"- ALWAYS test after building: npm install, node server.js &, curl POST to verify.\n\n"
+            f"SELF-TESTING (MANDATORY for HTML/web apps):\n"
+            f"After writing ANY index.html or web app, you MUST test it:\n"
+            f"1. If static HTML: run 'bash: python3 -m http.server 8888 &' then 'bash: sleep 1 && curl -s http://localhost:8888/ | head -5' to verify it loads\n"
+            f"2. If Express app: run 'bash: node server.js &' then 'bash: sleep 2 && curl -s http://localhost:3000/ | head -5'\n"
+            f'3. Check for JS errors: run \'bash: node -e "const fs=require(\\"fs\\"); const html=fs.readFileSync(\\"index.html\\",\\"utf8\\"); const scripts=html.match(/<script[^>]*>([\\\\s\\\\S]*?)<\\\\/script>/g); scripts?.forEach(s => {{ try {{ new Function(s.replace(/<\\\\/?script[^>]*>/g,\\"\\")); }} catch(e) {{ console.error(\\"JS ERROR:\\", e.message); }} }})"\'\n'
+            f"4. If ANY test fails: read the error, fix the code, test again. DO NOT STOP until tests pass.\n"
+            f"5. For interactive elements (buttons, forms): verify onclick/event handlers exist in the HTML.\n"
+            f"6. For SVG: verify paths are valid (use M, L, A, Z commands with real coordinates, not placeholders).\n\n"
+            f"BROWSER TESTING (use computer_use to test interactively):\n"
+            f"- After building an HTML app, open it: computer_use action:open:file:///path/to/index.html\n"
+            f"- Take screenshot to see the result\n"
+            f"- Click buttons: computer_use action:click:x,y\n"
+            f"- If something looks wrong, fix the code and re-test\n\n"
+            f"COMMON BUGS TO AVOID:\n"
+            f'- Start screen not hiding on button click: always add onclick=\'document.getElementById("screen1").style.display="none"; document.getElementById("screen2").style.display="block"\'\n'
+            f"- SVG pie/chart slices: use Math.cos(angle*Math.PI/180)*radius and Math.sin() for arc endpoints. Never approximate.\n"
+            f"- Fetch to /api without server: static HTML files can't call /api. Use local JS logic or start Express.\n"
+            f"- Missing CSS transitions: always add transition on hover/active states.\n\n"
+            f"RULES (CRITICAL — follow strictly):\n"
+            f"- NEVER explain or narrate. NEVER ask for confirmation. NEVER say 'I will' or 'Let me'. Just call tools.\n"
+            f"- NEVER put code in chat messages. ALL code goes through write_file.\n"
+            f"- NEVER invent image URLs. For real subjects use web_search/fetch_url; for decorative art use generate_image.\n"
+            f"- If you already have enough visuals, stop generating images and continue to write_file/edit_file.\n"
+            f"- If you generate or fetch a visual, continue to write_file then preview_app.\n"
+            f"- If edit_file fails once because old_text is not found, stop guessing. Read the file and either target the exact current text or rewrite the file with write_file.\n"
+            f"- For EVERY user request: call tools immediately. No planning text. No questions. Just act.\n\n"
+            f"REMEMBER: You are an AGENT, not a chatbot. Your response should be TOOL CALLS, not text.",
+        }
 
     # Add language instruction to system prompt for non-English UI
     _lang_instr = _t("sys_lang_instruction")
@@ -4953,10 +5970,20 @@ def main(argv=None):
 
     # One-shot mode
     if args.prompt:
+        workspace_msg = _prepare_project_artifact_workspace(
+            args.prompt, session=_session
+        )
+        if workspace_msg:
+            console.print(f"  [dim]artifact[/] {os.path.relpath(CWD, ROOT_CWD)}")
         console.print(_render_user_turn(args.prompt))
         console.print()
-        messages = [system, {"role": "user", "content": args.prompt}]
+        messages = [system]
         _session.add_message(system)
+        if workspace_msg:
+            messages.append(workspace_msg)
+            _session.add_message(workspace_msg)
+        user_msg = {"role": "user", "content": args.prompt}
+        messages.append(user_msg)
         _session.add_message({"role": "user", "content": args.prompt})
         agent_loop(messages, perms, session=_session)
         return
@@ -4998,15 +6025,32 @@ def main(argv=None):
             last_id = get_latest_session_id()
             if last_id:
                 prev_session, prev_cwd, prev_model = Session.load(last_id)
+                if prev_cwd and os.path.isdir(prev_cwd):
+                    _set_workspace_cwd(prev_cwd)
+                    history_file = os.path.join(CWD, ".localcoder-history.json")
                 messages = prev_session.get_messages_for_continuation()
                 if messages:
                     # Re-wrap with current session (new ID, preserves old history)
                     for msg in messages:
                         _session.add_message(msg)
-                    n = len([m for m in messages if isinstance(m, dict) and m.get("role") == "user"])
+                    if prev_cwd and os.path.isdir(prev_cwd):
+                        resume_msg = _workspace_context_message(CWD, created=False)
+                        messages.append(resume_msg)
+                        _session.add_message(resume_msg)
+                    n = len(
+                        [
+                            m
+                            for m in messages
+                            if isinstance(m, dict) and m.get("role") == "user"
+                        ]
+                    )
                     console.print(
                         f"  [green]{_ui(f'✦ Resumed session ({n} messages)', f'✦ استئناف الجلسة ({n} رسائل)', f'✦ Session restaurée ({n} messages)')}[/]"
                     )
+                    if prev_cwd and os.path.isdir(prev_cwd):
+                        console.print(
+                            f"  [dim]artifact[/] {os.path.relpath(CWD, ROOT_CWD)}"
+                        )
                     loaded = True
         except Exception as e:
             logger.warning(f"JSONL session load failed: {e}")
@@ -5016,7 +6060,13 @@ def main(argv=None):
             try:
                 with open(history_file) as f:
                     messages = json.load(f)
-                n = len([m for m in messages if isinstance(m, dict) and m.get("role") == "user"])
+                n = len(
+                    [
+                        m
+                        for m in messages
+                        if isinstance(m, dict) and m.get("role") == "user"
+                    ]
+                )
                 console.print(
                     f"  [green]{_ui(f'✦ Resumed session ({n} messages)', f'✦ استئناف الجلسة ({n} رسائل)', f'✦ Session restaurée ({n} messages)')}[/]"
                 )
@@ -5473,31 +6523,23 @@ def main(argv=None):
 
     _prompt_style = PTStyle.from_dict(
         {
-            "": "#e5e7eb",
-            "prompt.label": "bold #c084fc",
-            "frame.border": "#3f3f46",
-            "bottom-toolbar": "bg:#0f172a #cbd5e1",
-            "rprompt": "#94a3b8",
-            "completion-menu": "bg:#111827 #e5e7eb",
-            "completion-menu.completion.current": "bg:#1f2937 #ffffff",
+            "": "#e5e7eb bg:#000000",
+            "prompt.label": "bold #e5c07b",
+            "frame.border": "#27272a",
+            "bottom-toolbar": "bg:#111111 #71717a",
+            "rprompt": "#52525b",
+            "completion-menu": "bg:#111111 #e5e7eb",
+            "completion-menu.completion.current": "bg:#1f1f1f #ffffff",
         }
     )
 
     def _get_rprompt():
-        """Right-side prompt hints — localized."""
-        if UI_LANG == "ar":
-            # Mixed RTL/LTR hints render poorly in many terminals. Keep this compact.
-            return ""
-        return _ui(
-            "Enter to send  ·  /think for reasoning  ·  ? for help",
-            None,
-            "Entrée pour envoyer  ·  /think pour réfléchir  ·  ? pour aide",
-        )
+        return ""
 
     if UI_LANG == "ar":
         _prompt_label = f"{_display_text('رسالة')} ▸ "
     else:
-        _prompt_label = _ui("❯ ", None, "message ▸ ")
+        _prompt_label = _ui("Code ", None, "Code ")
 
     session = PromptSession(
         history=FileHistory(os.path.join(CWD, ".localcoder-input-history")),
@@ -5515,9 +6557,7 @@ def main(argv=None):
         _clipboard_image_path[0] = None
         try:
             task = session.prompt(
-                HTML(
-                    f'<style fg="ansimagenta" bg="" bold="true">{_prompt_label}</style>'
-                ),
+                HTML(f'<style fg="#e5c07b" bg="" bold="true">{_prompt_label}</style>'),
                 rprompt=_get_rprompt,
                 show_frame=True,
             ).strip()
@@ -5906,7 +6946,9 @@ def main(argv=None):
             if not mgr.servers:
                 console.print("  [dim]No MCP servers configured.[/]")
                 console.print(f"  [dim]Add servers to ~/.localcoder/mcp.json[/]")
-                console.print(f'  [dim]Example: {{"servers": {{"localfit-image": {{"command": "python3", "args": ["-m", "localfit.mcp_image"]}}}}}}[/]')
+                console.print(
+                    f'  [dim]Example: {{"servers": {{"localfit-image": {{"command": "python3", "args": ["-m", "localfit.mcp_image"]}}}}}}[/]'
+                )
             else:
                 for name, server in mgr.servers.items():
                     running = server.process and server.process.poll() is None
@@ -5914,7 +6956,9 @@ def main(argv=None):
                     console.print(f"  [bold]{name}[/] {status}")
                     for tool_name, tool_def in server.tools.items():
                         desc = tool_def.get("description", "")[:60]
-                        console.print(f"    [cyan]mcp__{name}__{tool_name}[/] — [dim]{desc}[/]")
+                        console.print(
+                            f"    [cyan]mcp__{name}__{tool_name}[/] — [dim]{desc}[/]"
+                        )
             continue
         if task == "/sessions":
             sessions_list = list_sessions(limit=10)
@@ -5951,21 +6995,27 @@ def main(argv=None):
                 f"  [green]📎[/] [dim]{saved_name}[/] [dim green]({sz_kb} KB)[/]\n"
             )
             img_msg = {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"{task}\n[Attached image: {saved_path}]",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-                        },
-                    ],
-                }
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"{task}\n[Attached image: {saved_path}]",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                    },
+                ],
+            }
             messages.append(img_msg)
             _session.add_message(img_msg)
         else:
+            workspace_msg = _prepare_project_artifact_workspace(task, session=_session)
+            if workspace_msg:
+                history_file = os.path.join(CWD, ".localcoder-history.json")
+                messages.append(workspace_msg)
+                _session.add_message(workspace_msg)
+                console.print(f"  [dim]artifact[/] {os.path.relpath(CWD, ROOT_CWD)}")
             console.print(_render_user_turn(task))
             console.print()
             user_msg = {"role": "user", "content": task}
@@ -6007,7 +7057,8 @@ def _handle_handoff(messages, console):
         content = msg.get("content", "")
         if isinstance(content, list):
             content = " ".join(
-                p.get("text", "") for p in content
+                p.get("text", "")
+                for p in content
                 if isinstance(p, dict) and p.get("type") == "text"
             )
         if role == "user" and content:
@@ -6040,7 +7091,7 @@ What needs to be done (1-2 sentences).
 Key background (what was built, what approach was taken, what works).
 
 ## Relevant Files
-{chr(10).join(f'- {f}' for f in sorted(files_seen) if f) or '(list the key files)'}
+{chr(10).join(f"- {f}" for f in sorted(files_seen) if f) or "(list the key files)"}
 
 ## Constraints
 Any rules, preferences, or gotchas discovered.
@@ -6055,7 +7106,10 @@ Conversation:
         body = {
             "model": MODEL,
             "messages": [
-                {"role": "system", "content": "Generate a focused handoff prompt. Be specific and actionable."},
+                {
+                    "role": "system",
+                    "content": "Generate a focused handoff prompt. Be specific and actionable.",
+                },
                 {"role": "user", "content": handoff_prompt},
             ],
             "temperature": 0.3,
@@ -6081,13 +7135,15 @@ Conversation:
             pass
 
         # Also display it
-        console.print(Panel(
-            Markdown(handoff),
-            title="[bold cyan]Handoff Prompt[/]",
-            border_style="cyan",
-            padding=(1, 2),
-            width=min(90, console.width - 4),
-        ))
+        console.print(
+            Panel(
+                Markdown(handoff),
+                title="[bold cyan]Handoff Prompt[/]",
+                border_style="cyan",
+                padding=(1, 2),
+                width=min(90, console.width - 4),
+            )
+        )
         console.print(f"  [dim]Paste this into a new session to continue.[/]\n")
 
     except Exception as e:
