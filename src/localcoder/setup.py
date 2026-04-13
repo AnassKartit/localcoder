@@ -1,5 +1,6 @@
-"""Interactive setup wizard — runs on first launch or `localcoder --setup`."""
-import json, os, sys
+"""Auto-setup — zero config, detects everything, starts everything."""
+
+import json, os, shutil, sys, time, urllib.request
 from pathlib import Path
 
 from rich.console import Console
@@ -8,10 +9,21 @@ from rich.table import Table
 from rich.text import Text
 
 from localcoder.backends import (
-    BACKENDS, MODELS, CONFIG_DIR, discover_all, get_system_ram_gb,
-    check_backend_installed, install_backend, download_model_hf,
-    download_model_ollama, find_model_file, start_llama_server,
-    start_ollama_serve, check_backend_running,
+    BACKENDS,
+    MODELS,
+    CONFIG_DIR,
+    discover_all,
+    get_system_ram_gb,
+    check_backend_installed,
+    install_backend,
+    download_model_hf,
+    download_model_ollama,
+    find_model_file,
+    start_llama_server,
+    start_ollama_serve,
+    check_backend_running,
+    get_running_models,
+    recommend_model,
 )
 
 console = Console()
@@ -29,293 +41,443 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
-def wizard():
-    """Interactive first-run setup wizard."""
-    console.print()
-    title = Text()
-    title.append("◆ ", style="bold magenta")
-    title.append("localcoder setup", style="bold white")
-    console.print(Panel(
-        "[bold]Welcome! Let's get your local AI coding agent running.[/]\n"
-        "[dim]This wizard will install a backend, download a model, and start serving.[/]",
-        title=title, title_align="left",
-        border_style="magenta", padding=(1, 2),
-    ))
+def _check_server(url, timeout=2):
+    """Check if a server is responding."""
+    try:
+        urllib.request.urlopen(url, timeout=timeout)
+        return True
+    except Exception:
+        return False
 
+
+def _wait_for_server(port, timeout=60):
+    """Wait for server to become ready."""
+    for _ in range(timeout // 2):
+        if _check_server(f"http://127.0.0.1:{port}/v1/models"):
+            return True
+        time.sleep(2)
+    return False
+
+
+def auto_setup():
+    """Zero-config auto-setup. Detects everything, starts everything, no questions.
+
+    Priority order:
+      1. Already running server → connect
+      2. localfit installed → use localfit run
+      3. llama-server installed + model downloaded → auto-start
+      4. Ollama installed → auto-start with best model
+      5. Nothing installed → install llama.cpp + download best model
+    """
     ram = get_system_ram_gb()
-    console.print(f"\n  [dim]System RAM:[/] [bold]{ram} GB[/]")
+    best_model_id, best_reason = recommend_model(ram)
 
-    # ── Step 1: Detect backends ──
-    console.print(f"\n  [bold magenta]Step 1:[/] Checking backends...\n")
+    # ── Step 1: Check if any server is already running ──
+    for bid in ("llamacpp", "ollama"):
+        if check_backend_running(bid):
+            models = get_running_models(bid)
+            model_name = models[0] if models else "local"
+            port = BACKENDS[bid]["default_port"]
+            api_url = f"http://127.0.0.1:{port}/v1"
+            console.print(f"  [green]✓[/] {BACKENDS[bid]['name']} running on :{port}")
+            if models:
+                console.print(f"  [green]✓[/] Model: {model_name}")
+            cfg = {
+                "model": model_name,
+                "api_base": api_url,
+                "backend": bid,
+                "model_id": best_model_id,
+                "setup_complete": True,
+            }
+            save_config(cfg)
+            return cfg
+
+    # ── Step 2: Try localfit (if installed) ──
+    localfit_bin = shutil.which("localfit")
+    if localfit_bin:
+        console.print(f"  [cyan]localfit[/] detected — auto-starting model...")
+        console.print(f"  [dim]Best for {ram}GB: {best_model_id} — {best_reason}[/]")
+        import subprocess
+
+        try:
+            subprocess.Popen(
+                [localfit_bin, "--serve", best_model_id, "--background"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            console.print(f"  [dim]Waiting for server...[/]")
+            if _wait_for_server(8089, timeout=120):
+                models = get_running_models("llamacpp")
+                model_name = models[0] if models else best_model_id
+                cfg = {
+                    "model": model_name,
+                    "api_base": "http://127.0.0.1:8089/v1",
+                    "backend": "llamacpp",
+                    "model_id": best_model_id,
+                    "setup_complete": True,
+                }
+                save_config(cfg)
+                console.print(f"  [green]✓[/] Server ready — {model_name}")
+                return cfg
+            else:
+                console.print(
+                    f"  [yellow]localfit server didn't start in time, trying direct...[/]"
+                )
+        except Exception:
+            pass
+
+    # ── Step 3: Try llama-server with existing model ──
+    if check_backend_installed("llamacpp"):
+        # Check if any model is already downloaded
+        for mid, minfo in MODELS.items():
+            if minfo.get("backend") == "llamacpp":
+                mfile = find_model_file(mid)
+                if mfile:
+                    console.print(
+                        f"  [cyan]llama.cpp[/] found with model: {minfo['name']}"
+                    )
+                    console.print(f"  [dim]Starting llama-server...[/]")
+                    proc = start_llama_server(mid)
+                    if proc and _wait_for_server(8089, timeout=60):
+                        models = get_running_models("llamacpp")
+                        model_name = models[0] if models else mid
+                        cfg = {
+                            "model": model_name,
+                            "api_base": "http://127.0.0.1:8089/v1",
+                            "backend": "llamacpp",
+                            "model_id": mid,
+                            "setup_complete": True,
+                        }
+                        save_config(cfg)
+                        console.print(f"  [green]✓[/] Server ready — {model_name}")
+                        return cfg
+
+    # ── Step 4: Try Ollama with existing or auto-pull model ──
+    if check_backend_installed("ollama"):
+        console.print(f"  [cyan]Ollama[/] detected — starting...")
+        if not check_backend_running("ollama"):
+            start_ollama_serve()
+            time.sleep(3)
+
+        # Check if best model's ollama tag exists
+        model_info = MODELS.get(best_model_id, {})
+        ollama_tag = model_info.get("ollama_tag")
+        if not ollama_tag:
+            # Find any model with an ollama tag that fits
+            for mid, minfo in MODELS.items():
+                if minfo.get("ollama_tag") and ram >= minfo.get("ram_required", 999):
+                    ollama_tag = minfo["ollama_tag"]
+                    best_model_id = mid
+                    model_info = minfo
+                    break
+
+        if ollama_tag:
+            console.print(f"  [dim]Pulling {ollama_tag}...[/]")
+            download_model_ollama(best_model_id)
+            if _wait_for_server(11434, timeout=120):
+                cfg = {
+                    "model": ollama_tag,
+                    "api_base": "http://127.0.0.1:11434/v1",
+                    "backend": "ollama",
+                    "model_id": best_model_id,
+                    "setup_complete": True,
+                }
+                save_config(cfg)
+                console.print(f"  [green]✓[/] Ollama ready — {ollama_tag}")
+                return cfg
+
+    # ── Step 5: Nothing installed — auto-install llama.cpp + download best model ──
+    console.print(f"\n  [yellow]No AI backend found. Auto-installing...[/]")
+    console.print(
+        f"  [dim]RAM: {ram}GB → Best model: {best_model_id} — {best_reason}[/]\n"
+    )
+
+    # Prefer llama.cpp (faster, better for coding)
+    console.print(f"  [bold]Installing llama.cpp...[/]")
+    if install_backend("llamacpp"):
+        console.print(f"  [green]✓[/] llama.cpp installed")
+        model_info = MODELS.get(best_model_id, {})
+        if model_info.get("backend") == "llamacpp" and model_info.get("hf_repo"):
+            console.print(f"  [bold]Downloading {model_info['name']}...[/]")
+            download_model_hf(best_model_id)
+            proc = start_llama_server(best_model_id)
+            if proc and _wait_for_server(8089, timeout=120):
+                models = get_running_models("llamacpp")
+                model_name = models[0] if models else best_model_id
+                cfg = {
+                    "model": model_name,
+                    "api_base": "http://127.0.0.1:8089/v1",
+                    "backend": "llamacpp",
+                    "model_id": best_model_id,
+                    "setup_complete": True,
+                }
+                save_config(cfg)
+                console.print(f"  [green]✓[/] Ready — {model_name}")
+                return cfg
+
+    # Last resort: try Ollama
+    console.print(f"  [bold]Trying Ollama...[/]")
+    if install_backend("ollama"):
+        start_ollama_serve()
+        time.sleep(3)
+        # Find an Ollama-compatible model
+        for mid, minfo in MODELS.items():
+            if minfo.get("ollama_tag") and ram >= minfo.get("ram_required", 999):
+                download_model_ollama(mid)
+                cfg = {
+                    "model": minfo["ollama_tag"],
+                    "api_base": "http://127.0.0.1:11434/v1",
+                    "backend": "ollama",
+                    "model_id": mid,
+                    "setup_complete": True,
+                }
+                save_config(cfg)
+                console.print(f"  [green]✓[/] Ready — {minfo['ollama_tag']}")
+                return cfg
+
+    console.print(f"  [red]Could not auto-setup. Install manually:[/]")
+    console.print(f"    [dim]pip install localfit && localfit run[/]")
+    return None
+
+
+def detect_and_connect():
+    """Smart model detection — scan everything, connect or launch.
+
+    Priority:
+      1. Scan all running servers → collect all available models
+      2. If exactly one model running → auto-connect
+      3. If multiple models running → show picker (like Open WebUI)
+      4. If nothing running → use localfit to start (GPU-aware)
+      5. If no localfit → auto_setup()
+
+    Returns (api_base, model_name, backend_id) or None.
+    """
+    from localcoder.backends import (
+        discover_all,
+        get_running_models,
+        get_system_ram_gb,
+        get_gpu_memory_info,
+        recommend_model,
+    )
+
+    console.print(f"\n  [dim]Scanning for running models...[/]")
+
+    # ── Step 1: Collect all running models across all backends ──
+    available = []  # list of (model_name, api_base, backend_id, port)
+
     discovery = discover_all()
-
-    table = Table(show_header=True, header_style="bold cyan", padding=(0, 2))
-    table.add_column("Backend")
-    table.add_column("Installed")
-    table.add_column("Running")
-    table.add_column("Models")
-
     for d in discovery:
-        installed = "[green]✓[/]" if d["installed"] else "[red]✗[/]"
-        running = f"[green]:{d['port']}[/]" if d["running"] else "[dim]—[/]"
-        models = ", ".join(d["models"][:3]) if d["models"] else "[dim]none[/]"
-        table.add_row(d["name"], installed, running, models)
+        if d["running"] and d["models"]:
+            for m in d["models"]:
+                api = f"http://127.0.0.1:{d['port']}/v1"
+                available.append((m, api, d["id"], d["port"]))
 
-    console.print(table)
+    # Also check common custom ports (vLLM, TGI, etc.)
+    for extra_port in [8000, 8080, 5000]:
+        try:
+            url = f"http://127.0.0.1:{extra_port}/v1/models"
+            req = urllib.request.Request(
+                url, headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                data = json.loads(resp.read())
+                for m in data.get("data", []):
+                    mid = m.get("id", "")
+                    if mid:
+                        available.append(
+                            (
+                                mid,
+                                f"http://127.0.0.1:{extra_port}/v1",
+                                "custom",
+                                extra_port,
+                            )
+                        )
+        except Exception:
+            pass
 
-    # ── Step 2: Install backend if needed ──
-    any_installed = any(d["installed"] for d in discovery)
-    if not any_installed:
-        console.print(f"\n  [bold magenta]Step 2:[/] No backend found. Install one:\n")
-        console.print(f"    [bold]1.[/] llama.cpp via Unsloth [dim](recommended for 26B, best speed)[/]")
-        console.print(f"    [bold]2.[/] Ollama [dim](easiest, good for E4B/E2B)[/]")
-        console.print(f"    [bold]3.[/] Both")
+    # ── Step 2: Decision based on what's available ──
+    if len(available) == 1:
+        # Exactly one model — auto-connect
+        model, api, bid, port = available[0]
+        console.print(f"  [green]✓[/] Found: [bold]{model}[/] on :{port}")
+        cfg = {
+            "model": model,
+            "api_base": api,
+            "backend": bid,
+            "model_id": model,
+            "setup_complete": True,
+        }
+        save_config(cfg)
+        return cfg
+
+    elif len(available) > 1:
+        # Multiple models — show picker
+        console.print(f"\n  [bold]Multiple models available:[/]\n")
+        for i, (model, api, bid, port) in enumerate(available):
+            backend_name = BACKENDS.get(bid, {}).get("name", bid)
+            console.print(
+                f"    [bold]{i + 1}.[/] [cyan]{model}[/]  [dim]{backend_name} :{port}[/]"
+            )
         console.print()
 
         try:
-            choice = input("  Choose (1/2/3): ").strip()
+            choice = input(f"  Choose (1-{len(available)}) [1]: ").strip()
         except (EOFError, KeyboardInterrupt):
-            return None
+            choice = "1"
 
-        if choice in ("1", "3"):
-            install_backend("llamacpp")
-        if choice in ("2", "3"):
-            install_backend("ollama")
+        idx = int(choice) - 1 if choice.isdigit() else 0
+        if idx < 0 or idx >= len(available):
+            idx = 0
 
-        # Re-discover
-        discovery = discover_all()
+        model, api, bid, port = available[idx]
+        console.print(f"  [green]✓[/] Selected: [bold]{model}[/] on :{port}")
+        cfg = {
+            "model": model,
+            "api_base": api,
+            "backend": bid,
+            "model_id": model,
+            "setup_complete": True,
+        }
+        save_config(cfg)
+        return cfg
 
-    # ── Step 3: Choose model ──
-    console.print(f"\n  [bold magenta]Step 3:[/] Choose a model:\n")
+    # ── Step 3: Nothing running — try localfit ──
+    console.print(f"  [dim]No models running.[/]")
 
-    recommended = []
-    for mid, m in MODELS.items():
-        fits = ram >= m["ram_required"]
-        rec = " [green](recommended)[/]" if fits and mid == "gemma4-26b" and ram >= 24 else ""
-        if not fits:
-            rec = f" [red](needs {m['ram_required']}GB+)[/]"
-        recommended.append((mid, m, fits, rec))
+    lf_bin = shutil.which("localfit")
+    if lf_bin:
+        ram = get_system_ram_gb()
+        gpu = get_gpu_memory_info()
+        gpu_total = gpu.get("total_mb", 0) // 1024
+        gpu_used = gpu.get("used_mb", 0) // 1024
+        gpu_free = gpu_total - gpu_used
 
-    for i, (mid, m, fits, rec) in enumerate(recommended):
-        style = "bold" if fits else "dim"
-        console.print(f"    [{style}]{i+1}. {m['name']}[/{style}] [dim]({m['size_gb']}GB, {m['description']})[/]{rec}")
+        best_id, best_reason = recommend_model(ram)
+        best_info = MODELS.get(best_id, {})
+        best_size = best_info.get("size_gb", 5)
 
-    console.print()
-    try:
-        choice = input("  Choose model (1-4): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return None
+        console.print(
+            f"\n  [dim]RAM: {ram}GB · GPU: {gpu_free}GB free / {gpu_total}GB[/]"
+        )
 
-    idx = int(choice) - 1 if choice.isdigit() else 0
-    if idx < 0 or idx >= len(recommended):
-        idx = 0
+        if gpu_free < best_size and gpu_used > 2:
+            # GPU is busy — warn and offer to free it
+            console.print(
+                f"  [yellow]GPU memory in use ({gpu_used}GB) — model needs ~{best_size}GB[/]"
+            )
+            console.print(
+                f"  [dim]localfit will unload conflicting models automatically.[/]"
+            )
 
-    model_id, model_info, _, _ = recommended[idx]
-    console.print(f"\n  [green]Selected: {model_info['name']}[/]")
+        console.print(
+            f"  [bold]Best model for your hardware:[/] {best_id} — {best_reason}"
+        )
+        console.print(f"\n  [dim]Starting via localfit...[/]")
 
-    # ── Step 4: Download model ──
-    console.print(f"\n  [bold magenta]Step 4:[/] Downloading model...\n")
-
-    model_file = find_model_file(model_id)
-    if model_file:
-        console.print(f"  [green]✓ Model already downloaded: {os.path.basename(model_file)}[/]")
-    else:
-        if model_info.get("backend") == "llamacpp" and model_info.get("hf_repo"):
-            download_model_hf(model_id)
-        elif model_info.get("ollama_tag"):
-            # Ensure Ollama is running
-            if not check_backend_running("ollama"):
-                start_ollama_serve()
-            download_model_ollama(model_id)
-
-    # ── Step 5: Determine backend + API URL ──
-    backend_id = model_info.get("backend", "ollama")
-    port = BACKENDS[backend_id]["default_port"]
-    api_url = f"http://127.0.0.1:{port}/v1"
-
-    # For llama.cpp models, start the server
-    if backend_id == "llamacpp":
-        if not check_backend_running("llamacpp"):
-            console.print(f"\n  [bold magenta]Step 5:[/] Starting llama-server...\n")
-            proc = start_llama_server(model_id, port)
-            if not proc:
-                console.print(f"  [yellow]Falling back to Ollama...[/]")
-                backend_id = "ollama"
-                port = 11434
-                api_url = f"http://127.0.0.1:{port}/v1"
-                if model_info.get("ollama_tag"):
-                    start_ollama_serve()
-                    download_model_ollama(model_id)
-        else:
-            console.print(f"\n  [green]✓ llama-server already running on :{port}[/]")
-    else:
-        if not check_backend_running("ollama"):
-            console.print(f"\n  [bold magenta]Step 5:[/] Starting Ollama...\n")
-            start_ollama_serve()
-
-    # ── Step 6: Save config ──
-    model_name = model_info.get("ollama_tag", model_id)
-    if backend_id == "llamacpp":
-        # Get actual model name from server
-        from localcoder.backends import get_running_models
-        running = get_running_models("llamacpp")
-        if running:
-            model_name = running[0]
-
-    cfg = {
-        "model": model_name,
-        "api_base": api_url,
-        "backend": backend_id,
-        "model_id": model_id,
-        "setup_complete": True,
-    }
-    save_config(cfg)
-
-    console.print(f"\n  [bold magenta]Step 6:[/] Configuration saved.\n")
-
-    # ── Step 7: Configure OpenCode / OpenClaw (optional) ──
-    console.print(f"  [bold magenta]Step 7:[/] Configure other tools?\n")
-
-    import shutil
-    has_opencode = shutil.which("opencode")
-    has_openclaw = shutil.which("openclaw")
-
-    if has_opencode or has_openclaw:
-        tools_found = []
-        if has_opencode:
-            tools_found.append("OpenCode")
-        if has_openclaw:
-            tools_found.append("OpenClaw")
-        console.print(f"  [green]Found:[/] {', '.join(tools_found)}")
-        console.print(f"  [dim]Auto-configure them to use your local model?[/]")
-        console.print(f"    [bold]1.[/] Yes — configure all [dim](recommended)[/]")
-        console.print(f"    [bold]2.[/] No — skip")
+        import subprocess
 
         try:
-            ans = input("\n  Choose (1/2): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            ans = "2"
+            subprocess.Popen(
+                [lf_bin, "--serve", best_id, "--background"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Wait for server
+            best_port = best_info.get("backend", "llamacpp")
+            wait_port = BACKENDS.get(best_port, {}).get("default_port", 8089)
+            console.print(f"  [dim]Waiting for server on :{wait_port}...[/]")
+            for w in range(60):
+                time.sleep(2)
+                try:
+                    models = get_running_models(best_port)
+                    if models:
+                        model = models[0]
+                        api = f"http://127.0.0.1:{wait_port}/v1"
+                        console.print(
+                            f"  [green]✓[/] Ready: [bold]{model}[/] on :{wait_port}"
+                        )
+                        cfg = {
+                            "model": model,
+                            "api_base": api,
+                            "backend": best_port,
+                            "model_id": best_id,
+                            "setup_complete": True,
+                        }
+                        save_config(cfg)
+                        return cfg
+                except Exception:
+                    pass
+                if w > 0 and w % 10 == 0:
+                    console.print(f"  [dim]Still starting... ({w * 2}s)[/]")
+        except Exception as e:
+            console.print(f"  [red]Failed to start: {e}[/]")
 
-        if ans == "1":
-            _configure_opencode(api_url, model_name, model_id, model_info)
-            _configure_openclaw(api_url, model_name, model_id, model_info)
-    else:
-        console.print(f"  [dim]No OpenCode or OpenClaw found. Install with:[/]")
-        console.print(f"    [dim]curl -fsSL https://opencode.ai/install | bash[/]")
-        console.print(f"    [dim]brew install openclaw[/]")
-
-    # ── Done ──
-    console.print()
-    console.print(Panel(
-        Text.assemble(
-            ("Setup complete! ", "bold green"),
-            ("Run ", "dim"), ("localcoder", "bold cyan"), (" to start.\n\n", "dim"),
-            ("Model:   ", "dim"), (f"{model_info['name']}\n", "bold cyan"),
-            ("Backend: ", "dim"), (f"{BACKENDS[backend_id]['name']} (:{port})\n", "green"),
-            ("API:     ", "dim"), (f"{api_url}\n", "dim"),
-        ),
-        border_style="green", padding=(1, 2),
-    ))
-
-    return cfg
-
-
-def _configure_opencode(api_url, model_name, model_id, model_info):
-    """Auto-configure OpenCode to use the local model."""
-    import shutil
-    if not shutil.which("opencode"):
-        return
-
-    config_path = Path.home() / ".config/opencode/opencode.json"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Load existing or create new
-    existing = {}
-    if config_path.exists():
-        try:
-            existing = json.loads(config_path.read_text())
-        except:
-            pass
-
-    # Add/update llamacpp provider
-    if "provider" not in existing:
-        existing["provider"] = {}
-
-    existing["provider"]["llamacpp"] = {
-        "name": "llama.cpp (local)",
-        "npm": "@ai-sdk/openai-compatible",
-        "options": {"baseURL": api_url},
-        "models": {
-            model_id: {
-                "name": model_info.get("name", model_name),
-                "tool_call": True,
-                "reasoning": False,
-                "modalities": {"input": ["text", "image"], "output": ["text"]},
-                "limit": {"context": 131072, "output": 8192},
-            }
-        },
-    }
-    existing["$schema"] = "https://opencode.ai/config.json"
-    existing["model"] = f"llamacpp/{model_id}"
-
-    config_path.write_text(json.dumps(existing, indent=2))
-    console.print(f"  [green]✓ OpenCode configured[/] [dim]({config_path})[/]")
-    console.print(f"    [dim]Model: llamacpp/{model_id} → {api_url}[/]")
-
-
-def _configure_openclaw(api_url, model_name, model_id, model_info):
-    """Auto-configure OpenClaw to use the local model."""
-    import shutil
-    if not shutil.which("openclaw"):
-        return
-
-    config_path = Path.home() / ".openclaw/openclaw.json"
-    if not config_path.exists():
-        console.print(f"  [dim]OpenClaw config not found — run 'openclaw' first to initialize[/]")
-        return
-
-    try:
-        cfg = json.loads(config_path.read_text())
-    except:
-        console.print(f"  [yellow]Could not parse OpenClaw config[/]")
-        return
-
-    # Add/update llamacpp provider
-    if "models" not in cfg:
-        cfg["models"] = {"mode": "merge", "providers": {}}
-    if "providers" not in cfg["models"]:
-        cfg["models"]["providers"] = {}
-
-    cfg["models"]["providers"]["llamacpp"] = {
-        "api": "openai-completions",
-        "baseUrl": api_url,
-        "apiKey": "dummy",
-        "models": [{
-            "id": model_name,
-            "name": model_info.get("name", model_name),
-            "reasoning": False,
-            "contextWindow": 131072,
-            "maxTokens": 8192,
-        }],
-    }
-
-    # Set as default model
-    if "agents" not in cfg:
-        cfg["agents"] = {"defaults": {}}
-    if "defaults" not in cfg["agents"]:
-        cfg["agents"]["defaults"] = {}
-    if "model" not in cfg["agents"]["defaults"]:
-        cfg["agents"]["defaults"]["model"] = {}
-    cfg["agents"]["defaults"]["model"]["primary"] = f"llamacpp/{model_name}"
-
-    config_path.write_text(json.dumps(cfg, indent=2))
-    console.print(f"  [green]✓ OpenClaw configured[/] [dim]({config_path})[/]")
-    console.print(f"    [dim]Model: llamacpp/{model_name} → {api_url}[/]")
+    # ── Step 4: Fallback to auto_setup ──
+    return auto_setup()
 
 
 def ensure_setup():
-    """Check if setup is done, run wizard if not."""
+    """Smart setup — always detect what's ACTUALLY running, update config.
+
+    Never trust stale config. Always scan real servers.
+    """
+    from localcoder.backends import discover_all, get_running_models
+
     cfg = load_config()
-    if cfg.get("setup_complete"):
+
+    # ── Always scan what's really running right now ──
+    available = []
+    discovery = discover_all()
+    for d in discovery:
+        if d["running"] and d["models"]:
+            for m in d["models"]:
+                api = f"http://127.0.0.1:{d['port']}/v1"
+                available.append((m, api, d["id"], d["port"]))
+
+    # Also check common custom ports
+    for extra_port in [8000, 8080, 5000]:
+        try:
+            url = f"http://127.0.0.1:{extra_port}/v1/models"
+            req = urllib.request.Request(
+                url, headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                data = json.loads(resp.read())
+                for m in data.get("data", []):
+                    mid = m.get("id", "")
+                    if mid:
+                        available.append(
+                            (
+                                mid,
+                                f"http://127.0.0.1:{extra_port}/v1",
+                                "custom",
+                                extra_port,
+                            )
+                        )
+        except Exception:
+            pass
+
+    if available:
+        # Use the first running model (or match config if possible)
+        best = available[0]
+        # Try to match what config says we should use
+        if cfg.get("model"):
+            for a in available:
+                if cfg["model"] in a[0] or a[0] in cfg.get("model", ""):
+                    best = a
+                    break
+
+        model, api, bid, port = best
+        # Update config with what's ACTUALLY running
+        cfg["model"] = model
+        cfg["api_base"] = api
+        cfg["backend"] = bid
+        cfg["model_id"] = model
+        cfg["setup_complete"] = True
+        save_config(cfg)
         return cfg
-    return wizard()
+
+    # Nothing running — detect and connect (start servers)
+    if cfg.get("setup_complete"):
+        console.print(f"  [yellow]No server running — starting...[/]")
+    return detect_and_connect()

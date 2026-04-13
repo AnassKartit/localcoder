@@ -141,6 +141,25 @@ def _terminal_supports_inline_images():
     )
 
 
+def _launch_inline_images_enabled(cfg):
+    raw = os.environ.get("LOCALCODER_LAUNCH_INLINE_IMAGE")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(cfg.get("launch_inline_image", False))
+
+
+def _resolve_remote_api_key(cli_key=None):
+    return (
+        cli_key
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("AZURE_OPENAI_API_KEY")
+        or os.environ.get("AZURE_AI_API_KEY")
+        or os.environ.get("FOUNDRY_API_KEY")
+        or os.environ.get("LOCALCODER_API_KEY")
+        or ""
+    )
+
+
 def _terminal_prefers_arabic_rtl():
     tp = _terminal_program().lower()
     return (
@@ -505,9 +524,24 @@ def main():
     parser.add_argument("--yolo", action="store_true", help="Auto-approve everything")
     parser.add_argument("--bypass", action="store_true", help="Same as --yolo")
     parser.add_argument("--ask", action="store_true", help="Ask before every tool")
-    parser.add_argument("--compact", action="store_true", help="Compact system prompt (best for small models)")
-    parser.add_argument("--system", type=str, default=None, help="Custom system prompt (string or path to file)")
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Compact system prompt (best for small models)",
+    )
+    parser.add_argument(
+        "--system",
+        type=str,
+        default=None,
+        help="Custom system prompt (string or path to file)",
+    )
     parser.add_argument("--api", type=str, default=None, help="API base URL")
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for OpenAI-compatible remote endpoints",
+    )
     parser.add_argument("--setup", action="store_true", help="Run setup wizard")
     parser.add_argument("--models", action="store_true", help="List and select models")
     parser.add_argument("--status", action="store_true", help="Show backend status")
@@ -902,7 +936,10 @@ def main():
                 for m in d["models"]:
                     console.print(f"    [cyan]{m}[/]")
         if not any(d["models"] for d in discovery):
-            console.print("  [dim]No models found. Run: localcoder --setup[/]")
+            console.print("  [dim]No models found — launching setup wizard...[/]")
+            from localcoder.setup import wizard
+
+            wizard()
         return
 
     # ── Ensure setup (skip when --api points to a running server) ──
@@ -914,19 +951,27 @@ def main():
         import urllib.request
 
         api_base = args.api.rstrip("/")
-        # Try /health (llama-server) first, then root (Ollama)
+        api_key = _resolve_remote_api_key(args.api_key)
+        # Try /models with auth header (works for Modal, OpenAI-compatible servers)
         reachable = False
-        for health_url in [f"{api_base}/health", api_base.replace("/v1", "")]:
+        for health_url in [
+            f"{api_base}/models",
+            f"{api_base}/health",
+            api_base.replace("/v1", ""),
+        ]:
             try:
-                urllib.request.urlopen(health_url, timeout=3)
+                req = urllib.request.Request(health_url)
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                urllib.request.urlopen(req, timeout=5)
                 reachable = True
                 break
             except Exception:
                 continue
         if not reachable:
-            console.print(f"  [red]Server not reachable at {api_base}[/]")
-            console.print(f"  [dim]Start it first: localfit --serve <model>[/]")
-            return
+            # Don't block -- remote APIs may have cold starts
+            console.print(f"  [yellow]Server may be starting (cold start)...[/]")
+            console.print(f"  [dim]API: {api_base}[/]")
         # Build minimal config from CLI args
         cfg = load_config() or {}
         cfg["setup_complete"] = True
@@ -942,8 +987,16 @@ def main():
             return
 
     # ── Resolve config ──
-    api_base = args.api or cfg.get("api_base", "http://127.0.0.1:8089/v1")
+    api_base = (args.api or cfg.get("api_base", "http://127.0.0.1:8089/v1")).rstrip("/")
     model = args.model or cfg.get("model", "gemma4-26b")
+    if args.api_key:
+        os.environ["LOCALCODER_API_KEY"] = args.api_key
+
+    # Update globals IMMEDIATELY so boot screen shows correct info
+    from localcoder import localcoder_agent
+
+    localcoder_agent.MODEL = model
+    localcoder_agent.API_BASE = api_base
     ui_lang = (
         "ar"
         if args.arabic
@@ -991,8 +1044,13 @@ def main():
         backend_id = "ollama"
         api_base = "http://127.0.0.1:11434/v1"
 
-    # ── Check backend is running, auto-start if needed ──
-    if not check_backend_running(backend_id):
+    # ── Detect if this is a remote API (Modal, OpenRouter, etc.) ──
+    is_remote = args.api and not any(
+        local in args.api for local in ["127.0.0.1", "localhost", "0.0.0.0"]
+    )
+
+    # ── Check backend is running, auto-start if needed (LOCAL only) ──
+    if not is_remote and not check_backend_running(backend_id):
         ram = get_system_ram_gb()
         gpu = get_gpu_memory_info()
         model_info = MODELS.get(cfg.get("model_id", ""), {})
@@ -1046,9 +1104,16 @@ def main():
                         model = ollama_model
                 else:
                     console.print(
-                        "  [red]No backend available. Run: localcoder --setup[/]"
+                        "  [yellow]No backend available — launching setup wizard...[/]"
                     )
-                    return
+                    from localcoder.setup import wizard
+
+                    cfg = wizard()
+                    if not cfg:
+                        return
+                    api_base = cfg.get("api_base", "http://127.0.0.1:8089/v1")
+                    model = cfg.get("model", model)
+                    backend_id = cfg.get("backend", "llamacpp")
         else:
             if not check_backend_running("ollama"):
                 if not start_ollama_serve():
@@ -1059,9 +1124,16 @@ def main():
                         api_base = "http://127.0.0.1:8089/v1"
                     else:
                         console.print(
-                            "  [red]No backend available. Run: localcoder --setup[/]"
+                            "  [yellow]No backend available — launching setup wizard...[/]"
                         )
-                        return
+                        from localcoder.setup import wizard
+
+                        cfg = wizard()
+                        if not cfg:
+                            return
+                        api_base = cfg.get("api_base", "http://127.0.0.1:8089/v1")
+                        model = cfg.get("model", model)
+                        backend_id = cfg.get("backend", "llamacpp")
 
     # ── Boot sequence (like an OS POST screen) ──
     from localcoder.backends import (
@@ -1076,16 +1148,35 @@ def main():
     )
     import time as _t
 
-    skip_boot = cfg.get("skip_boot_health", False) or args.api
+    boot_mode = (
+        os.environ.get("LOCALCODER_BOOT_MODE")
+        or cfg.get("boot_mode")
+        or ("fast" if not args.prompt else "full")
+    ).strip().lower()
+    skip_boot = cfg.get("skip_boot_health", False) or args.api or boot_mode != "full"
+
+    # Ensure cfg reflects current args (not stale config file)
+    if args.model:
+        cfg["model"] = args.model
+        cfg["model_id"] = args.model
+    if args.api:
+        cfg["api_base"] = args.api
 
     if skip_boot:
         if not args.prompt:
-            _render_terminal_launch_logo(cfg, lang=ui_lang)
+            if _launch_inline_images_enabled(cfg):
+                _render_terminal_launch_logo(cfg, lang=ui_lang)
         # Fast mode — one line
         specs = get_machine_specs()
+        metal = get_metal_gpu_stats()
         diag = diagnose_gpu_health(cfg.get("model_id"))
         swap_mb = get_swap_usage_mb()
-        ga, gt = diag.get("gpu_alloc_mb", 0), diag.get("gpu_total_mb", 0)
+        ga = metal.get("alloc_mb", 0) or diag.get("gpu_alloc_mb", 0)
+        gt = (
+            metal.get("total_mb", 0)
+            or specs.get("gpu_total_mb", 0)
+            or diag.get("gpu_total_mb", 0)
+        )
         gc = "green" if ga < gt * 0.8 else "yellow" if ga < gt else "red"
         sc = "red" if swap_mb > 4000 else "green"
         sc2 = {"healthy": "green", "degraded": "yellow", "critical": "red"}.get(
@@ -1113,7 +1204,9 @@ def main():
             status, "dim"
         )
 
-        used_image_logo = _render_terminal_launch_logo(cfg, lang=ui_lang)
+        used_image_logo = False
+        if _launch_inline_images_enabled(cfg):
+            used_image_logo = _render_terminal_launch_logo(cfg, lang=ui_lang)
 
         # Calculate model GPU usage
         model_mb = 0
@@ -1198,7 +1291,29 @@ def main():
                 "Model", f"[cyan]{mn}{mq}{ms}[/]", f"{gb}  ctx {srv['n_ctx'] // 1024}K"
             )
         else:
-            t.add_row("Model", "[dim]not running[/]", "[dim]will auto-start[/]")
+            # Check Ollama for loaded models
+            _ollama_model = None
+            try:
+                import urllib.request as _ur_mdl, json as _j_mdl
+
+                _or = _ur_mdl.urlopen("http://127.0.0.1:11434/api/ps", timeout=2)
+                _od = _j_mdl.loads(_or.read())
+                if _od.get("models"):
+                    _om = _od["models"][0]
+                    _ollama_model = _om.get("name", "")
+                    _osize = _om.get("size", 0) // (1024**3)
+            except Exception:
+                pass
+            if _ollama_model:
+                t.add_row(
+                    "Model",
+                    f"[cyan]{_ollama_model}[/]",
+                    f"[green]● Ollama[/]  {_osize}GB GPU",
+                )
+            else:
+                t.add_row(
+                    "Model", "[dim]not running[/]", "[dim]type /models to start[/]"
+                )
 
         # Machine
         t.add_row(
@@ -1208,8 +1323,35 @@ def main():
         )
 
         if used_image_logo:
+            # Detect actual connection status - check configured API
+            _online = srv["running"]
+            if not _online:
+                # Check Ollama
+                try:
+                    import urllib.request as _ur_boot
+
+                    _ur_boot.urlopen("http://127.0.0.1:11434/v1/models", timeout=1)
+                    _online = True
+                except Exception:
+                    pass
+            if not _online:
+                # Check the API we were launched with
+                try:
+                    import urllib.request as _ur_boot2
+
+                    _ur_boot2.urlopen(f"{api_base}/models", timeout=1)
+                    _online = True
+                except Exception:
+                    pass
+            _status_text = (
+                _ui_text(ui_lang, "online", "متصل")
+                if _online
+                else _ui_text(ui_lang, "offline", "دون اتصال")
+            )
+            _status_color = "#53d6ff" if _online else "red"
+            _dot = "✓" if _online else "✗"
             console.print(
-                f"  [#d7b46a]✦[/] [dim]{_ui_text(ui_lang, 'Command-line interface', 'واجهة سطر الأوامر')}[/]  [bold #53d6ff]{_ui_text(ui_lang, 'offline', 'دون اتصال')}[/]"
+                f"  [#d7b46a]✦[/] [dim]{_ui_text(ui_lang, 'Command-line interface', 'واجهة سطر الأوامر')}[/]  [{_status_color}]{_dot} {_status_text}[/{_status_color}]"
             )
             console.print()
             console.print(
@@ -1464,6 +1606,9 @@ def main():
                 pass
 
         # Clear boot screen, start fresh
+        os.system("clear" if os.name != "nt" else "cls")
+
+    if not args.prompt:
         os.system("clear" if os.name != "nt" else "cls")
 
     # ── Set env and run the agent ──

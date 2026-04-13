@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>سيرة ألبرت أينشتاين</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #0a0a14;
+            font-family: 'system-ui', sans-serif;
+        }
+        .card {
+            background-color: rgba(255, 255, 255, 0.04);
+            backdrop-filter: blur(20px);
+            border-radius: 24px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .title-gradient {
+            background-image: linear-gradient(to right, #f97316, #22c55e);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+        .btn-gradient {
+            background-image: linear-gradient(135deg, #6366f1, #8b5cf6);
+        }
+        .btn-gradient:hover {
+            opacity: 0.9;
+        }
+    </style>
+</head>
+<body class="text-white min-h-screen p-4">
+
+    <div class="max-w-4xl mx-auto mt-10">
+        
+        <header class="text-center mb-12">
+            <h1 class="text-6xl font-extrabold title-gradient mb-4">ألبرت أينشتاين</h1>
+            <p class="text-xl text-gray-400">عبقري الفيزياء ومُغير وجه العلم</p>
+        </header>
+
+        <div class="card p-8 shadow-2xl">
+            <div class="flex flex-col md:flex-row items-center gap-8 mb-8">
+                <!-- Image Section -->
+                <div class="flex-shrink-0">
+                    <img src="einstein.png" alt="صورة ألبرت أينشتاين" class="w-64 h-64 object-cover rounded-full shadow-xl border-4 border-indigo-500">
+                </div>
+                
+                <!-- Biography Content Section -->
+                <div class="flex-grow">
+                    <h2 class="text-3xl font-bold title-gradient mb-4">نبذة عن حياته</h2>
+                    <p class="text-lg leading-relaxed mb-4 text-gray-300">
+                        ألبرت أينشتاين هو عالم فيزياء نظري ألماني، يُعتبر واحدًا من أهم الشخصيات العلمية في التاريخ الحديث. اشتهر نظرياته الرائدة التي غيرت فهمنا للكون والمادة والطاقة. 
+                        يُعرف بشكل خاص بنظريته النسبية، سواء كانت الخاصة أو العامة، والتي وضعت حجر الأساس للفيزياء الحديثة. 
+                    </p>
+                    <p class="text-lg leading-relaxed text-gray-300">
+                        أحد أبرز إنجازاته هو معادلة $E=mc^2$ الشهيرة، التي تربط بين الكتلة والطاقة، وأصبحت واحدة من أشهر المعادلات في العالم. 
+                        كان أينشتاين شخصية مثيرة للجدل، وكان مؤمناً قوياً بالسلام وحقوق الإنسان، مما جعله رمزاً للفكر الإنساني والعلمي المتكامل.
+                    </p>
+                </div>
+            </div>
+
+            <!-- Action Button Example -->
+            <div class="text-center mt-10">
+                <button class="btn-gradient text-white font-bold py-3 px-8 rounded-lg shadow-lg transition duration-300 text-lg">
+                    اكتشف المزيد عن إرثه
+                </button>
+            </div>
+        </div>
+        
+        <footer class="text-center mt-8 text-gray-500 text-sm">
+            تم تصميم هذا العرض باستخدام تقنيات الويب الحديثة.
+        </footer>
+
+    </div>
+
+</body>
+</html>

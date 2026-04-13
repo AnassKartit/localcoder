@@ -34,6 +34,7 @@ def build_app(app_id, output_dir):
 
     with open(config_path) as f:
         cfg = json.load(f)
+    app_dir = os.path.join(APPS_DIR, app_id)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -57,6 +58,22 @@ def build_app(app_id, output_dir):
         css = f.read()
     with open(os.path.join(SHELL_DIR, 'base.js')) as f:
         base_js = f.read()
+
+    custom_css = ''
+    custom_html = ''
+    custom_js = ''
+    custom_css_path = os.path.join(app_dir, 'app.css')
+    custom_html_path = os.path.join(app_dir, 'app.html')
+    custom_js_path = os.path.join(app_dir, 'app.js')
+    if os.path.exists(custom_css_path):
+        with open(custom_css_path) as f:
+            custom_css = f.read()
+    if os.path.exists(custom_html_path):
+        with open(custom_html_path) as f:
+            custom_html = f.read()
+    if os.path.exists(custom_js_path):
+        with open(custom_js_path) as f:
+            custom_js = f.read()
 
     # Load adapters based on config
     adapter_js = ''
@@ -160,7 +177,7 @@ def build_app(app_id, output_dir):
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{cfg["title"]} {cfg["icon"]}</title>
-  <style>{css}{theme_css}</style>
+      <style>{css}{theme_css}{custom_css}</style>
 </head>
 <body>
   <div class="app-container">
@@ -169,12 +186,13 @@ def build_app(app_id, output_dir):
       <div class="app-subtitle">{cfg["subtitle"]}</div>
     </div>
 
-    <div class="app-card">
-      <div class="input-area">
-        <textarea id="input" placeholder="{cfg.get("placeholder", "Type here...")}" oninput="autoResize(this)"></textarea>
-        {adapter_html}
-        <button id="analyzeBtn" class="btn-primary" onclick="analyze()">
-          <span class="btn-icon">⚡</span> Analyze
+      <div class="app-card">
+        <div class="input-area">
+          <textarea id="input" placeholder="{cfg.get("placeholder", "Type here...")}" oninput="autoResize(this)"></textarea>
+          {custom_html}
+          {adapter_html}
+          <button id="analyzeBtn" class="btn-primary" onclick="analyze()">
+            <span class="btn-icon">⚡</span> Analyze
         </button>
       </div>
     </div>
@@ -194,6 +212,7 @@ def build_app(app_id, output_dir):
 {base_js}
 {adapter_js}
 {analyze_fn}
+{custom_js}
 
     // Enter to analyze
     document.getElementById('input').addEventListener('keydown', e => {{

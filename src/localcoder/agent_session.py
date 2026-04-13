@@ -130,6 +130,9 @@ class Session:
                     session._compacted_at = len(session._messages)
                 elif etype == "model_change":
                     model = entry.get("new")
+                elif etype == "workspace":
+                    data = entry.get("data") or {}
+                    cwd = data.get("cwd", cwd)
 
         return session, cwd, model
 
@@ -159,9 +162,19 @@ def list_sessions(limit=10):
     results = []
     for path in sessions[:limit]:
         try:
+            info = {}
             with open(path, "r") as f:
-                first_line = f.readline().strip()
-                info = json.loads(first_line) if first_line else {}
+                for idx, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    if idx == 0:
+                        info = entry
+                    if entry.get("type") == "workspace":
+                        data = entry.get("data") or {}
+                        if data.get("cwd"):
+                            info["cwd"] = data["cwd"]
 
             # Count messages
             msg_count = 0

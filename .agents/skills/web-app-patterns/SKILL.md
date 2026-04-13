@@ -1,3 +1,8 @@
+---
+name: web-app-patterns
+description: Reference patterns for building web applications with a lightweight backend. Use when the user asks for a web app, Express server, or a project that needs a backend.
+---
+
 # Web App Patterns
 
 Reference patterns for building web applications. Load this skill when the user asks to build a web app, Express server, or any project that needs a backend.

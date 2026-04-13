@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -118,6 +119,7 @@ class TestPackaging(unittest.TestCase):
             bypass=True,
             ask=False,
             api="http://127.0.0.1:8089/v1",
+            api_key="foundry-key",
             unrestricted=True,
         )
 
@@ -130,10 +132,12 @@ class TestPackaging(unittest.TestCase):
             "-m", "gemma4-26b",
             "--yolo",
             "--api", "http://127.0.0.1:8089/v1",
+            "--api-key", "foundry-key",
             "--unrestricted",
         ])
         self.assertEqual(os.environ["GEMMA_API_BASE"], "http://127.0.0.1:8089/v1")
         self.assertEqual(os.environ["GEMMA_MODEL"], "gemma4-26b")
+        self.assertEqual(os.environ["LOCALCODER_API_KEY"], "foundry-key")
 
 
 class TestSandbox(unittest.TestCase):
@@ -256,6 +260,196 @@ class TestDeploy(unittest.TestCase):
         route = open(os.path.join(template_dir, "src/app/api/ai/route.ts")).read()
         self.assertIn("{{SYSTEM_PROMPT}}", route)
         self.assertIn("LLM_API_BASE", route)
+
+
+class TestAgentLoopHeuristics(unittest.TestCase):
+    """Regression tests for small-model agent behavior."""
+
+    def test_landing_page_gets_visual_budget(self):
+        from localcoder import localcoder_agent as agent
+
+        self.assertEqual(
+            agent._visual_budget_for_request("create einstein bio landing page timeline"),
+            1,
+        )
+
+    def test_small_model_prefers_real_photo_tools_before_generate_image(self):
+        from localcoder import localcoder_agent as agent
+
+        messages = [{"role": "user", "content": "create einstein bio landing page timeline"}]
+        with patch.object(agent, "MODEL", "gemma4-e4b"):
+            names = [t["function"]["name"] for t in agent._select_tools_for_turn(messages, [])]
+
+        self.assertIn("web_search", names)
+        self.assertNotIn("generate_image", names)
+        self.assertNotIn("preview_app", names)
+
+    def test_large_model_also_blocks_generated_portraits_for_real_bios(self):
+        from localcoder import localcoder_agent as agent
+
+        messages = [{"role": "user", "content": "create a biography of Albert Einstein with images"}]
+        with patch.object(agent, "MODEL", "gemma4-26b"):
+            names = [t["function"]["name"] for t in agent._select_tools_for_turn(messages, [])]
+
+        self.assertIn("web_search", names)
+        self.assertNotIn("generate_image", names)
+
+    def test_small_model_stops_offering_more_images_after_default_visual(self):
+        from localcoder import localcoder_agent as agent
+
+        messages = [{"role": "user", "content": "create einstein bio landing page timeline"}]
+        with patch.object(agent, "MODEL", "gemma4-e4b"):
+            names = [
+                t["function"]["name"]
+                for t in agent._select_tools_for_turn(messages, ["search:einstein photo", "fetch:https://example.com/einstein.jpg", "image:einstein portrait"])
+            ]
+
+        self.assertNotIn("generate_image", names)
+
+    def test_generic_bio_search_does_not_unlock_generated_portraits(self):
+        from localcoder import localcoder_agent as agent
+
+        messages = [{"role": "user", "content": "create a biography of Albert Einstein with images"}]
+        recent_tools = ["search:albert einstein biography wikipedia"]
+        with patch.object(agent, "MODEL", "gemma4-e4b"):
+            names = [t["function"]["name"] for t in agent._select_tools_for_turn(messages, recent_tools)]
+
+        self.assertIn("web_search", names)
+        self.assertNotIn("generate_image", names)
+
+    def test_detects_image_loop(self):
+        from localcoder import localcoder_agent as agent
+
+        self.assertEqual(
+            agent._detect_tool_loop(
+                ["image:portrait one", "image:portrait two", "image:portrait three"]
+            ),
+            "image",
+        )
+
+    def test_read_file_keeps_raw_html_for_exact_editing(self):
+        from localcoder import localcoder_agent as agent
+
+        html = "<html><body><section><h1>Albert Einstein Timeline</h1></section></body></html>"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "index.html")
+            with open(path, "w") as f:
+                f.write(html)
+            with patch.object(agent, "CWD", tmpdir):
+                result = agent.exec_tool("read_file", {"path": "index.html"})
+
+        self.assertIn("<section>", result)
+        self.assertIn("Albert Einstein Timeline", result)
+
+
+class TestInterruptHandling(unittest.TestCase):
+    """Interrupt handling should preserve context and keep helpers detached."""
+
+    def test_detached_popen_kwargs_detach_from_ctrl_c(self):
+        from localcoder import localcoder_agent as agent
+
+        kwargs = agent._detached_popen_kwargs()
+
+        self.assertIs(kwargs["stdin"], agent.subprocess.DEVNULL)
+        if os.name == "nt":
+            self.assertIn("creationflags", kwargs)
+        else:
+            self.assertTrue(kwargs.get("start_new_session"))
+
+    def test_persist_interrupted_turn_keeps_partial_reply_and_resume_note(self):
+        from localcoder import localcoder_agent as agent
+
+        messages = [{"role": "system", "content": "base"}]
+        msg = {
+            "role": "assistant",
+            "content": "Partial draft",
+            "reasoning_content": "Need to refine the layout.",
+        }
+
+        agent._persist_interrupted_turn(messages, msg)
+
+        self.assertEqual(messages[-2]["role"], "assistant")
+        self.assertEqual(messages[-2]["content"], "Partial draft")
+        self.assertTrue(messages[-2]["interrupted"])
+        self.assertIn("reasoning_content", messages[-2])
+        self.assertEqual(messages[-1]["role"], "system")
+        self.assertIn("interrupted by the user", messages[-1]["content"])
+
+
+class TestProjectArtifacts(unittest.TestCase):
+    """New project requests should get isolated artifact workspaces."""
+
+    def test_detects_new_project_requests(self):
+        from localcoder import localcoder_agent as agent
+
+        self.assertTrue(agent._request_needs_artifact_workspace("build a recipe app with a clean landing page"))
+        self.assertFalse(agent._request_needs_artifact_workspace("fix src/localcoder/cli.py banner spacing"))
+
+    def test_prepare_project_artifact_workspace_creates_hidden_folder(self):
+        from localcoder import localcoder_agent as agent
+
+        class SessionRecorder:
+            def __init__(self):
+                self.events = []
+
+            def add_event(self, event_type, data=None):
+                self.events.append((event_type, data or {}))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = SessionRecorder()
+            with patch.object(agent, "ROOT_CWD", tmpdir), patch.object(agent, "CWD", tmpdir), patch.object(
+                agent, "SNAPSHOT_DIR", os.path.join(tmpdir, ".localcoder-snapshots")
+            ):
+                workspace_msg = agent._prepare_project_artifact_workspace(
+                    "create an Albert Einstein biography website", session=session
+                )
+
+            self.assertIsNotNone(workspace_msg)
+            workspace_root = session.events[0][1]["cwd"]
+            self.assertTrue(workspace_root.startswith(os.path.join(tmpdir, ".localcoder-artifacts")))
+            self.assertTrue(os.path.isdir(os.path.join(workspace_root, "assets")))
+            self.assertIn(".localcoder-artifacts", workspace_msg["content"])
+
+    def test_session_load_uses_latest_workspace_cwd(self):
+        from localcoder.agent_session import Session
+        from localcoder import agent_session
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir)
+            with patch.object(agent_session, "SESSIONS_DIR", sessions_dir):
+                session = Session(cwd="/repo/root", model="gemma4-e4b")
+                session.add_event("workspace", {"cwd": "/repo/root/.localcoder-artifacts/einstein"})
+                loaded, cwd, model = Session.load(session.session_id)
+
+            self.assertEqual(cwd, "/repo/root/.localcoder-artifacts/einstein")
+
+
+class TestCliLaunch(unittest.TestCase):
+    """CLI launch toggles should prefer simple defaults while keeping opt-ins."""
+
+    def test_inline_launch_images_are_opt_in(self):
+        from localcoder import cli
+
+        with patch.dict(os.environ, {}, clear=False):
+            self.assertFalse(cli._launch_inline_images_enabled({}))
+            self.assertTrue(cli._launch_inline_images_enabled({"launch_inline_image": True}))
+
+        with patch.dict(os.environ, {"LOCALCODER_LAUNCH_INLINE_IMAGE": "1"}, clear=False):
+            self.assertTrue(cli._launch_inline_images_enabled({}))
+
+
+class TestSkills(unittest.TestCase):
+    """Bundled skills should satisfy the loader contract."""
+
+    def test_web_app_patterns_has_yaml_frontmatter(self):
+        skill_path = os.path.join(
+            os.path.dirname(__file__), "..", ".agents", "skills", "web-app-patterns", "SKILL.md"
+        )
+        with open(skill_path) as f:
+            first_line = f.readline().strip()
+
+        self.assertEqual(first_line, "---")
 
 
 class TestSlashCommands(unittest.TestCase):

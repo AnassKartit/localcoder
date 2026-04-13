@@ -18,7 +18,7 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
 // ── AI Analysis Endpoint ──
 app.post('/api/analyze', async (req, res) => {
-  const { message, image, audio } = req.body;
+  const { message, image, audio, history } = req.body;
 
   // Build user content based on input type
   let userContent;
@@ -40,6 +40,15 @@ app.post('/api/analyze', async (req, res) => {
   }
 
   try {
+    const priorMessages = Array.isArray(history)
+      ? history
+          .filter(item => item && (item.role === 'user' || item.role === 'assistant'))
+          .map(item => ({
+            role: item.role,
+            content: Array.isArray(item.content) ? item.content : String(item.content || '')
+          }))
+      : [];
+
     const response = await fetch(`${API_BASE}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -52,6 +61,7 @@ app.post('/api/analyze', async (req, res) => {
         max_tokens: 2048,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
+          ...priorMessages,
           { role: 'user', content: userContent }
         ]
       })

@@ -5547,7 +5547,6 @@ def show_banner():
 
     console.print(_render_launch_surface(len(star_frames) - 1))
     console.print()
-    console.print(status_line)
     console.print(f"{_cpad}[dim]{os.path.basename(CWD)}/[/]")
     console.print()
 
