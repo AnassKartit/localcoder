@@ -4098,6 +4098,7 @@ def chat_api(messages, spinner=None, tools=None):
     # Only include tools if available and model supports them
     if selected_tools:
         body["tools"] = selected_tools
+        body["tool_choice"] = "auto"  # Azure best practice: let model decide
     # Azure/remote models use max_completion_tokens instead of max_tokens
     if is_remote:
         body["max_completion_tokens"] = 16000
