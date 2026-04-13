@@ -4088,6 +4088,28 @@ def chat_api(messages, spinner=None, tools=None):
     is_small_model = _is_small_model_name()
     is_remote = bool(_resolve_remote_api_key())
     buffer_text_until_done = is_small_model
+
+    # Models that do NOT support function calling (per Azure AI Foundry docs)
+    # These will hallucinate tool calls as text if given tools
+    _no_tools_models = {
+        "grok-4",
+        "grok-4-20-reasoning",
+        "grok-4-fast-non-reasoning",
+        "grok-4-1-fast-non-reasoning",
+        "grok-4-1-fast-reasoning",
+        "grok-3-mini",
+        "deepseek-r1",
+        "deepseek-r1-0528",
+        "o1-mini",
+        "o1-preview",
+        "o3-pro",
+        "codex-mini",
+        "gpt-4.5-preview",
+        "gpt-35-turbo",
+    }
+    model_lower = MODEL.lower().replace(" ", "-")
+    skip_tools = is_remote and any(m in model_lower for m in _no_tools_models)
+
     body = {
         "model": MODEL,
         "messages": messages,
@@ -4095,10 +4117,14 @@ def chat_api(messages, spinner=None, tools=None):
         "top_p": 0.9 if is_small_model else 0.95,
         "stream": True,
     }
-    # Only include tools if available and model supports them
-    if selected_tools:
+    # Only include tools if model supports function calling
+    if selected_tools and not skip_tools:
         body["tools"] = selected_tools
         body["tool_choice"] = "auto"  # Azure best practice: let model decide
+    elif skip_tools:
+        logging.getLogger("localcoder").info(
+            f"Skipping tools for {MODEL} — model does not support function calling"
+        )
     # Azure/remote models use max_completion_tokens instead of max_tokens
     if is_remote:
         body["max_completion_tokens"] = 16000
