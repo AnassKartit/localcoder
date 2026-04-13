@@ -245,6 +245,57 @@ _UI_BUILD_HINTS = (
     "gallery",
     "dashboard",
 )
+_WORK_INTENT_HINTS = (
+    "fix",
+    "build",
+    "create",
+    "make",
+    "write",
+    "edit",
+    "change",
+    "update",
+    "search",
+    "find",
+    "open",
+    "run",
+    "install",
+    "debug",
+    "review",
+    "read",
+    "show",
+    "list",
+    "generate",
+    "preview",
+    "implement",
+    "refactor",
+    "explain",
+    "summarize",
+    "analyze",
+    "test",
+    "use ",
+    "check",
+)
+_CASUAL_TURNS = {
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "sup",
+    "thanks",
+    "thank you",
+    "cool",
+    "nice",
+    "ok",
+    "okay",
+    "sounds good",
+    "great",
+}
+_CASUAL_QUESTIONS = (
+    "how are you",
+    "what's up",
+    "whats up",
+    "who are you",
+)
 
 _FRONTEND_DESIGN_NOTE = (
     "The latest user request is a frontend design task. "
@@ -436,6 +487,23 @@ def _visual_budget_for_request(text):
     return 0
 
 
+def _is_casual_turn(text):
+    lower = re.sub(r"\s+", " ", (text or "")).strip().lower()
+    if not lower:
+        return False
+    if lower.startswith("/"):
+        return False
+    if lower in _CASUAL_TURNS:
+        return True
+    if any(question in lower for question in _CASUAL_QUESTIONS):
+        return True
+    if any(hint in lower for hint in _WORK_INTENT_HINTS):
+        return False
+    if len(lower.split()) <= 3 and re.fullmatch(r"[a-zA-Z\s!?'.-]+", lower):
+        return True
+    return False
+
+
 def _tool_name(tool_def):
     return tool_def.get("function", {}).get("name", "")
 
@@ -549,6 +617,8 @@ def _fallback_web_search(query, max_results=5):
 def _select_tools_for_turn(messages, recent_tools=None):
     recent_tools = recent_tools or []
     last_user_text = _latest_user_text(messages)
+    if _is_casual_turn(last_user_text):
+        return []
     is_small = _is_small_model_name()
     allowed = set(_BUILTIN_TOOL_NAMES)
     visual_budget = _visual_budget_for_request(last_user_text)
@@ -1100,6 +1170,38 @@ def _resolve_remote_api_key(cli_key=None):
         or os.environ.get("LOCALCODER_API_KEY")
         or ""
     )
+
+
+def _first_choice(response):
+    choices = (response or {}).get("choices") or []
+    return choices[0] if choices else {}
+
+
+def _first_message(response):
+    choice = _first_choice(response)
+    return choice.get("message") or {}
+
+
+def _first_data_item(response):
+    data = (response or {}).get("data") or []
+    return data[0] if data else {}
+
+
+def _message_text_content(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in ("text", "output_text"):
+                text = item.get("text") or item.get("content") or ""
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
 
 
 def _set_workspace_cwd(path):
@@ -3984,15 +4086,21 @@ def chat_api(messages, spinner=None, tools=None):
 
     selected_tools = TOOLS if tools is None else tools
     is_small_model = _is_small_model_name()
+    is_remote = bool(_resolve_remote_api_key())
     buffer_text_until_done = is_small_model
     body = {
         "model": MODEL,
         "messages": messages,
-        "tools": selected_tools,
         "temperature": 0.2 if is_small_model else 0.7,
         "top_p": 0.9 if is_small_model else 0.95,
         "stream": True,
     }
+    # Only include tools if available and model supports them
+    if selected_tools:
+        body["tools"] = selected_tools
+    # Azure/remote models use max_completion_tokens instead of max_tokens
+    if is_remote:
+        body["max_completion_tokens"] = 16000
     if REASONING_EFFORT != "medium":
         body["reasoning_effort"] = REASONING_EFFORT
     payload = json.dumps(body).encode()
@@ -4005,6 +4113,31 @@ def chat_api(messages, spinner=None, tools=None):
     _api_key = _resolve_remote_api_key()
     if _api_key:
         req.add_header("Authorization", f"Bearer {_api_key}")
+
+    # Handle 400 errors from remote APIs (often caused by unsupported tools)
+    try:
+        _resp_stream = urllib.request.urlopen(req, timeout=300)
+    except urllib.error.HTTPError as e:
+        if e.code == 400 and selected_tools and is_remote:
+            # Retry without tools — some remote models don't support function calling
+            logging.getLogger("localcoder").warning(
+                f"Remote API returned 400 with tools — retrying without tools"
+            )
+            body.pop("tools", None)
+            payload = json.dumps(body).encode()
+            req = urllib.request.Request(
+                f"{API_BASE}/chat/completions",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+            )
+            if _api_key:
+                req.add_header("Authorization", f"Bearer {_api_key}")
+            _resp_stream = urllib.request.urlopen(req, timeout=300)
+        else:
+            raise
 
     content_parts = []
     reasoning_parts = []
@@ -4020,7 +4153,60 @@ def chat_api(messages, spinner=None, tools=None):
     last_chunk_at = time.time()
     idle_timeout = 180  # seconds — finalize partial args if LLM stalls
 
+    def _kill_spinner():
+        """Fully stop the spinner and clear its terminal line."""
+        nonlocal spinner
+        if spinner:
+            try:
+                if spinner._live is not None:
+                    spinner._live.stop()
+                    spinner._live = None
+            except Exception:
+                pass
+            spinner = None
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+    def _nonstream_response(data):
+        choice = _first_choice(data)
+        msg = dict(choice.get("message") or {})
+        content = _message_text_content(msg.get("content", ""))
+        reasoning = _message_text_content(msg.get("reasoning_content", ""))
+        if reasoning and REASONING_EFFORT != "none" and not buffer_text_until_done:
+            console.print(_render_reasoning_panel(reasoning, stream_started_at))
+            console.print()
+        if not content and reasoning:
+            content = reasoning
+        if content and not msg.get("tool_calls"):
+            show_response(content)
+        msg["content"] = content
+        if reasoning:
+            msg["reasoning_content"] = reasoning
+        nonstream_usage = data.get("usage") or {
+            "completion_tokens": estimate_tokens(content or reasoning),
+            "prompt_tokens": 0,
+            "total_tokens": estimate_tokens(content or reasoning),
+        }
+        nonstream_timings = data.get("timings") or {}
+        return {
+            "choices": [
+                {
+                    "message": msg,
+                    "finish_reason": choice.get("finish_reason"),
+                }
+            ],
+            "usage": nonstream_usage,
+            "timings": nonstream_timings,
+            "model": data.get("model", MODEL),
+        }
+
     with urllib.request.urlopen(req, timeout=300) as resp:
+        content_type = (resp.headers.get("Content-Type", "") or "").lower()
+        if "text/event-stream" not in content_type:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            _kill_spinner()
+            return _nonstream_response(data)
+
         # Set socket timeout for idle detection
         try:
             resp.fp.raw._sock.settimeout(idle_timeout)
@@ -4062,21 +4248,6 @@ def chat_api(messages, spinner=None, tools=None):
                     usage = chunk["usage"]
                 if chunk.get("timings"):
                     timings = chunk["timings"]
-
-                def _kill_spinner():
-                    """Fully stop the spinner and clear its terminal line."""
-                    nonlocal spinner
-                    if spinner:
-                        try:
-                            if spinner._live is not None:
-                                spinner._live.stop()
-                                spinner._live = None
-                        except Exception:
-                            pass
-                        spinner = None
-                        # Clear the spinner line and move cursor
-                        sys.stdout.write("\r\033[K")
-                        sys.stdout.flush()
 
                 # Keep reasoning buffered so we can render it as a clean card
                 # instead of the old narrow ANSI box.
@@ -5546,8 +5717,6 @@ def show_banner():
         pass
 
     console.print(_render_launch_surface(len(star_frames) - 1))
-    console.print()
-    console.print(f"{_cpad}[dim]{os.path.basename(CWD)}/[/]")
     console.print()
 
 
